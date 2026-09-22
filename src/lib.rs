@@ -1,4 +1,7 @@
 mod cli;
+pub mod model;
+mod report;
+pub mod scanner;
 
 use std::{ffi::OsString, process::ExitCode};
 
@@ -12,12 +15,25 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
             println!("preflightx {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Ok(cli::Command::Scan(path)) => {
-            eprintln!(
-                "SCAN INCOMPLETE: repository scanning is not implemented yet: {}",
-                path.display()
-            );
-            ExitCode::from(2)
+        Ok(cli::Command::Scan(arguments)) => {
+            let report = scanner::scan(&arguments.path, &scanner::ScanLimits::default());
+            match arguments.format {
+                cli::Format::Terminal => print!("{}", report::terminal(&report)),
+                cli::Format::Json => match report::json(&report) {
+                    Ok(output) => print!("{output}"),
+                    Err(error) => {
+                        eprintln!("failed to serialize report: {error}");
+                        return ExitCode::from(2);
+                    }
+                },
+            }
+            if report.status == model::ScanStatus::Incomplete {
+                ExitCode::from(2)
+            } else if report.failed_policy(arguments.fail_on) {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(message) => {
             eprintln!("{message}\n\n{}", cli::HELP);

