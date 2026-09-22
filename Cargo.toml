@@ -1,0 +1,9 @@
+[package]
+name = "preflightx"
+version = "0.1.0"
+edition = "2024"
+description = "Pre-execution security scanner for untrusted source repositories"
+publish = false
+
+[dependencies]
+
