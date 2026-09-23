@@ -1397,9 +1397,44 @@ impl Evaluator<'_> {
                     && let Expr::Name(name) = object.as_ref()
                 {
                     let mut array = environment.get(name).cloned().unwrap_or_default();
-                    for argument in args {
-                        array.merge(argument);
+                    let inserted_receiver = usize::from(!function.labels.is_empty());
+                    let values = args.into_iter().skip(inserted_receiver).collect::<Vec<_>>();
+                    if method == "unshift" {
+                        let offset = values.len();
+                        array.fields = std::mem::take(&mut array.fields)
+                            .into_iter()
+                            .map(|(key, value)| {
+                                let key = key
+                                    .parse::<usize>()
+                                    .map_or(key.clone(), |index| (index + offset).to_string());
+                                (key, value)
+                            })
+                            .collect();
                     }
+                    let start = if method == "push" {
+                        array
+                            .fields
+                            .keys()
+                            .filter_map(|key| key.parse::<usize>().ok())
+                            .max()
+                            .map_or(0, |index| index + 1)
+                    } else {
+                        0
+                    };
+                    for (offset, value) in values.into_iter().enumerate() {
+                        array.merge(value.clone());
+                        let index = if method == "push" {
+                            start + offset
+                        } else {
+                            offset
+                        };
+                        array.fields.insert(index.to_string(), value);
+                    }
+                    array.name = None;
+                    array.literal = None;
+                    array.path_hint = None;
+                    array.path_key = None;
+                    array.stream_reader = false;
                     environment.insert(name.clone(), array);
                     return Value::default();
                 }
