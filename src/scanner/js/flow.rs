@@ -282,6 +282,7 @@ impl Lower<'_> {
             },
             Expression::AwaitExpression(awaited) => self.expr(&awaited.argument),
             Expression::ParenthesizedExpression(paren) => self.expr(&paren.expression),
+            Expression::UnaryExpression(unary) => Expr::Combine(vec![self.expr(&unary.argument)]),
             Expression::TSAsExpression(cast) => self.expr(&cast.expression),
             Expression::TSSatisfiesExpression(cast) => self.expr(&cast.expression),
             Expression::TSNonNullExpression(cast) => self.expr(&cast.expression),
@@ -690,7 +691,11 @@ impl Lower<'_> {
                     }
                     _ => {}
                 }
-                Vec::new()
+                export
+                    .declaration
+                    .as_expression()
+                    .map(|expression| vec![Stmt::Expr(self.expr(expression))])
+                    .unwrap_or_default()
             }
             Statement::ExpressionStatement(expression) => {
                 vec![Stmt::Expr(self.expr(&expression.expression))]
@@ -700,6 +705,8 @@ impl Lower<'_> {
                 .as_ref()
                 .map(|expression| vec![Stmt::Return(self.expr(expression))])
                 .unwrap_or_default(),
+            Statement::ThrowStatement(throw) => vec![Stmt::Expr(self.expr(&throw.argument))],
+            Statement::LabeledStatement(labeled) => self.statement(&labeled.body, functions),
             Statement::BlockStatement(block) => self.statements(&block.body, functions),
             Statement::IfStatement(branch) => vec![Stmt::Branch(
                 self.expr(&branch.test),
