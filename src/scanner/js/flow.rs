@@ -231,6 +231,28 @@ impl Lower<'_> {
                 vec![self.expr(&import.source)],
                 self.line(import.span.start),
             ),
+            Expression::ChainExpression(chain) => match &chain.expression {
+                oxc_ast::ast::ChainElement::CallExpression(call) => Expr::Call(
+                    Box::new(self.expr(&call.callee)),
+                    call.arguments
+                        .iter()
+                        .map(|argument| self.argument(argument))
+                        .collect(),
+                    self.line(call.span.start),
+                ),
+                oxc_ast::ast::ChainElement::StaticMemberExpression(member) => Expr::Member(
+                    Box::new(self.expr(&member.object)),
+                    member.property.name.to_string(),
+                ),
+                oxc_ast::ast::ChainElement::ComputedMemberExpression(member) => Expr::Member(
+                    Box::new(self.expr(&member.object)),
+                    static_string(&member.expression).unwrap_or_else(|| "*".to_owned()),
+                ),
+                oxc_ast::ast::ChainElement::TSNonNullExpression(expression) => {
+                    self.expr(&expression.expression)
+                }
+                _ => Expr::Unknown,
+            },
             Expression::AwaitExpression(awaited) => self.expr(&awaited.argument),
             Expression::ParenthesizedExpression(paren) => self.expr(&paren.expression),
             Expression::TSAsExpression(cast) => self.expr(&cast.expression),
