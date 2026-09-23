@@ -1,6 +1,7 @@
 mod cli;
 pub mod model;
 mod report;
+mod rules;
 pub mod scanner;
 
 use std::{ffi::OsString, process::ExitCode};
@@ -15,6 +16,20 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
             println!("preflightx {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        Ok(cli::Command::Rules) => {
+            print!("{}", rules::list());
+            ExitCode::SUCCESS
+        }
+        Ok(cli::Command::Rule(id)) => match rules::show(&id) {
+            Some(output) => {
+                print!("{output}");
+                ExitCode::SUCCESS
+            }
+            None => {
+                eprintln!("unknown rule: {id}");
+                ExitCode::from(3)
+            }
+        },
         Ok(cli::Command::Scan(arguments)) => {
             let report = scanner::scan(&arguments.path, &scanner::ScanLimits::default());
             match arguments.format {

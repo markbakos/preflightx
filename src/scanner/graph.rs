@@ -1,5 +1,5 @@
 use super::js::{Capability, ModuleFacts};
-use crate::model::{Confidence, Finding, Severity};
+use crate::model::{Confidence, FileRecord, Finding, Severity};
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Component, Path};
@@ -34,11 +34,11 @@ pub fn roots(path: &str, text: Option<&str>, roles: &[String]) -> Vec<Root> {
         && let Some(scripts) = value.get("scripts").and_then(Value::as_object)
     {
         for (name, command) in scripts {
-            if let Some(command) = command.as_str()
-                && let Some(target) = command_target(command)
-            {
+            if let Some(command) = command.as_str() {
                 roots.push(Root {
-                    file: resolve_from(path, &target),
+                    file: script_target(command, scripts, 0)
+                        .map(|target| resolve_from(path, &target))
+                        .unwrap_or_default(),
                     trigger: format!("npm {name} ({path})"),
                     line: text.and_then(|text| find_line(text, &format!("\"{name}\""))),
                 });
@@ -65,12 +65,67 @@ pub fn roots(path: &str, text: Option<&str>, roles: &[String]) -> Vec<Root> {
             }
         }
     }
+    if roles
+        .iter()
+        .any(|role| role == "ci_config" || role == "build_script")
+        && let Some(text) = text
+    {
+        for (index, line) in text.lines().enumerate() {
+            let command = line
+                .trim()
+                .trim_start_matches("run:")
+                .trim_start_matches("RUN ")
+                .trim();
+            if let Some(target) = command_target(command) {
+                roots.push(Root {
+                    file: if roles.iter().any(|role| role == "ci_config") {
+                        target.trim_start_matches("./").to_owned()
+                    } else {
+                        resolve_from(path, &target)
+                    },
+                    trigger: format!("build or CI command in {path}"),
+                    line: Some(index as u64 + 1),
+                });
+            }
+        }
+    }
     roots
 }
 
-fn command_target(command: &str) -> Option<String> {
+fn script_target(
+    command: &str,
+    scripts: &serde_json::Map<String, Value>,
+    depth: usize,
+) -> Option<String> {
+    if depth >= 8 {
+        return None;
+    }
+    if let Some(target) = command_target(command) {
+        return Some(target);
+    }
     let parts: Vec<_> = command.split_ascii_whitespace().collect();
-    let executable = parts.first()?.trim_matches(['"', '\'']);
+    let referenced = match parts.as_slice() {
+        ["npm", "run", name, ..] | ["pnpm", "run", name, ..] | ["yarn", "run", name, ..] => {
+            Some(*name)
+        }
+        _ => None,
+    }?;
+    let nested = scripts.get(referenced)?.as_str()?;
+    script_target(nested, scripts, depth + 1)
+}
+
+fn command_target(command: &str) -> Option<String> {
+    let mut parts = command.split_ascii_whitespace().peekable();
+    let mut executable = parts.next()?.trim_matches(['"', '\'']);
+    if executable == "cross-env" || executable == "env" {
+        executable = parts.find(|part| !part.contains('='))?;
+    }
+    if matches!(executable, "npx" | "pnpm" | "yarn") {
+        executable = parts.next()?;
+        if executable == "exec" {
+            executable = parts.next()?;
+        }
+    }
     if !matches!(
         executable,
         "node" | "node.exe" | "bun" | "deno" | "tsx" | "ts-node"
@@ -78,8 +133,6 @@ fn command_target(command: &str) -> Option<String> {
         return None;
     }
     parts
-        .iter()
-        .skip(1)
         .map(|part| part.trim_matches(['"', '\'', ';']))
         .find(|part| {
             !part.starts_with('-')
@@ -95,7 +148,7 @@ fn find_line(text: &str, needle: &str) -> Option<u64> {
         .map(|offset| text[..offset].bytes().filter(|byte| *byte == b'\n').count() as u64 + 1)
 }
 
-pub fn build(modules: &[ModuleFacts], roots: &[Root]) -> GraphResult {
+pub fn build(modules: &[ModuleFacts], roots: &[Root], files: &[FileRecord]) -> GraphResult {
     let by_path: BTreeMap<_, _> = modules
         .iter()
         .map(|module| (module.path.as_str(), module))
@@ -166,10 +219,11 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root]) -> GraphResult {
                 queue.push_back((*path, route));
             }
         } else {
-            unresolved.push(format!(
-                "{} -> {} (entry unresolved)",
-                root.trigger, root.file
-            ));
+            unresolved.push(if root.file.is_empty() {
+                format!("{} (command target unresolved)", root.trigger)
+            } else {
+                format!("{} -> {} (entry unresolved)", root.trigger, root.file)
+            });
         }
     }
     while let Some((source, route)) = queue.pop_front() {
@@ -190,6 +244,10 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root]) -> GraphResult {
     }
 
     let mut findings = Vec::new();
+    let file_records: BTreeMap<_, _> = files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
     for module in modules {
         let route = reachable.get(module.path.as_str());
         let disguised = !has_code_extension(&module.path);
@@ -213,12 +271,35 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root]) -> GraphResult {
         let dangerous = module.calls.iter().find(|call| {
             matches!(
                 call.capability,
-                Some(Capability::DynamicCode | Capability::Process | Capability::Secret)
+                Some(
+                    Capability::DynamicCode
+                        | Capability::Process
+                        | Capability::Secret
+                        | Capability::Network
+                )
             ) && call
                 .function
                 .as_ref()
                 .is_none_or(|name| called_functions.contains(name))
         });
+        if let (Some(route), Some(call), Some(record)) =
+            (route, dangerous, file_records.get(module.path.as_str()))
+            && let Some(signal) = record.raw_signals.iter().find(|signal| {
+                signal.starts_with("code follows ") || signal.contains("logical EOF")
+            })
+        {
+            findings.push(Finding {
+                    id: "JS-CONCEALED-EXECUTION".to_owned(),
+                    severity: Severity::High,
+                    confidence: Confidence::High,
+                    score: 88,
+                    title: "Reachable execution capability is visually concealed".to_owned(),
+                    message: "Executable JavaScript combines an evidenced execution route, concealment, and a code or process execution capability.".to_owned(),
+                    file: Some(module.path.clone()),
+                    line: Some(call.line),
+                    evidence: route.iter().cloned().chain([format!("concealment: {signal}"), format!("capability: {}", call.name)]).collect(),
+                });
+        }
         if disguised && let Some(route) = route {
             findings.push(Finding {
                     id: "JS-REACHABLE-DISGUISED-SOURCE".to_owned(),

@@ -82,6 +82,19 @@ pub fn analyze(path: &str, bytes: &[u8], text: Option<&str>) -> RawAnalysis {
         if text.contains("charCodeAt") && text.contains('^') {
             signals.push("possible XOR string decoder".to_owned());
         }
+        let hex_identifiers = text.matches("_0x").count();
+        if hex_identifiers >= 8 {
+            signals.push(format!("_0x-style identifiers: {hex_identifiers}"));
+        }
+        if text.contains("debugger;") || text.contains("navigator.webdriver") {
+            signals.push("anti-debugging or automation check".to_owned());
+        }
+        if ["VirtualBox", "VMware", "QEMU", "Parallels"]
+            .iter()
+            .any(|marker| text.contains(marker))
+        {
+            signals.push("virtual-machine environment check".to_owned());
+        }
         if text.contains("Invoke-WebRequest") || text.contains("Invoke-Expression") {
             signals.push("PowerShell download or execution primitive".to_owned());
         }

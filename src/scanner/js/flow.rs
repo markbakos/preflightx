@@ -33,13 +33,14 @@ pub enum Stmt {
     Bind(Binding, Expr),
     Expr(Expr),
     Return(Expr),
-    Branch(Vec<Stmt>, Vec<Stmt>),
+    Branch(Expr, Vec<Stmt>, Vec<Stmt>),
 }
 
 #[derive(Clone, Debug)]
 pub enum Expr {
     Name(String),
     String(String),
+    Bool(bool),
     Member(Box<Expr>, String),
     Call(Box<Expr>, Vec<Expr>, u64),
     Object(Vec<(String, Expr)>),
@@ -103,6 +104,7 @@ impl Lower<'_> {
         match expression {
             Expression::Identifier(value) => Expr::Name(value.name.to_string()),
             Expression::StringLiteral(value) => Expr::String(value.value.to_string()),
+            Expression::BooleanLiteral(value) => Expr::Bool(value.value),
             Expression::TemplateLiteral(value) if value.expressions.is_empty() => Expr::String(
                 value
                     .quasis
@@ -291,6 +293,7 @@ impl Lower<'_> {
                 .unwrap_or_default(),
             Statement::BlockStatement(block) => self.statements(&block.body, functions),
             Statement::IfStatement(branch) => vec![Stmt::Branch(
+                self.expr(&branch.test),
                 self.statement(&branch.consequent, functions),
                 branch
                     .alternate
@@ -498,6 +501,54 @@ pub fn analyze_flows(
         let mut environment = evaluator.imports(module);
         evaluator.run(&module.path, &module.flow.body, &mut environment, 0);
     }
+    let remote = evaluator
+        .findings
+        .iter()
+        .filter(|finding| {
+            matches!(
+                finding.id.as_str(),
+                "JS-REMOTE-CODE-EXECUTION" | "JS-REMOTE-PROCESS-EXECUTION"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let secrets = evaluator
+        .findings
+        .iter()
+        .filter(|finding| finding.id == "JS-SECRET-EXFILTRATION")
+        .cloned()
+        .collect::<Vec<_>>();
+    for execution in remote {
+        let same_route = secrets.iter().find(|secret| {
+            secret.file == execution.file
+                || execution
+                    .file
+                    .as_ref()
+                    .and_then(|file| reachable.get(file))
+                    .and_then(|route| route.first())
+                    .is_some_and(|trigger| {
+                        secret
+                            .file
+                            .as_ref()
+                            .and_then(|file| reachable.get(file))
+                            .and_then(|route| route.first())
+                            == Some(trigger)
+                    })
+        });
+        if let Some(secret) = same_route {
+            evaluator.findings.push(Finding {
+                id: "JS-COMBINED-ATTACK-CHAIN".to_owned(),
+                severity: Severity::Critical,
+                confidence: Confidence::High,
+                score: 99,
+                title: "One execution route can exfiltrate secrets and execute remote input".to_owned(),
+                message: "Separate source-to-sink findings share a file or evidenced execution trigger. This correlation does not establish a malware family.".to_owned(),
+                file: execution.file.clone(),
+                line: execution.line,
+                evidence: vec![format!("component: {} at {}:{}", execution.id, execution.file.as_deref().unwrap_or("unknown"), execution.line.unwrap_or(0)), format!("component: {} at {}:{}", secret.id, secret.file.as_deref().unwrap_or("unknown"), secret.line.unwrap_or(0))],
+            });
+        }
+    }
     FlowResult {
         findings: evaluator.findings,
         incomplete_reasons: if evaluator.limited {
@@ -559,7 +610,14 @@ impl Evaluator<'_> {
                     }
                     return Some(value);
                 }
-                Stmt::Branch(yes, no) => {
+                Stmt::Branch(condition, yes, no) => {
+                    if let Expr::Bool(value) = condition {
+                        let branch = if *value { yes } else { no };
+                        if let Some(value) = self.run(path, branch, environment, depth + 1) {
+                            return Some(value);
+                        }
+                        continue;
+                    }
                     let mut left = environment.clone();
                     let mut right = environment.clone();
                     let a = self.run(path, yes, &mut left, depth + 1);
@@ -627,6 +685,7 @@ impl Evaluator<'_> {
                 .cloned()
                 .unwrap_or_else(|| Value::named(name.clone())),
             Expr::String(text) => Value::literal(text.clone()),
+            Expr::Bool(_) => Value::default(),
             Expr::Member(object, property) => {
                 let base = self.eval(path, object, environment, depth);
                 let full_name = Some(
@@ -636,7 +695,15 @@ impl Evaluator<'_> {
                         .unwrap_or_else(|| format!(".{property}")),
                 );
                 if full_name.as_deref() == Some("process.env") {
-                    return Value::labeled(Label::EnvSecret, format!("source: {path} process.env"));
+                    let mut value =
+                        Value::labeled(Label::EnvSecret, format!("source: {path} process.env"));
+                    value.name = full_name;
+                    return value;
+                }
+                if base.name.as_deref() == Some("process.env")
+                    && matches!(property.as_str(), "NODE_ENV" | "CI" | "DEBUG" | "TERM")
+                {
+                    return Value::named(format!("process.env.{property}"));
                 }
                 let mut value = base.fields.get(property).cloned().unwrap_or(base);
                 value.name = full_name;
@@ -784,9 +851,27 @@ impl Evaluator<'_> {
             value.literal = Some("$HOME".to_owned());
             return value;
         }
+        if matches!(normalized, "path.join" | "path.resolve") {
+            let mut value = Value::default();
+            let mut segments = Vec::new();
+            for arg in &args {
+                value.merge(arg.clone());
+                if let Some(segment) = &arg.literal {
+                    segments.push(segment.trim_matches('/'));
+                } else {
+                    return value;
+                }
+            }
+            value.literal = Some(segments.join("/"));
+            return value;
+        }
         if matches!(
             normalized,
-            "clipboard.readText" | "clipboard.read" | "electron.clipboard.readText"
+            "clipboard.readText"
+                | "clipboard.read"
+                | "clipboardy.read"
+                | "clipboardy.readSync"
+                | "electron.clipboard.readText"
         ) {
             return Value::labeled(Label::Clipboard, source);
         }
@@ -816,16 +901,39 @@ impl Evaluator<'_> {
                 args.first().and_then(|value| value.literal.clone()),
                 args.get(1),
             )
-            && contents
+        {
+            if persistence_path(&target) {
+                self.findings.push(Finding {
+                    id: "JS-PERSISTENCE-WRITE".to_owned(),
+                    severity: Severity::High,
+                    confidence: Confidence::High,
+                    score: 85,
+                    title: "JavaScript writes to an automatic startup location".to_owned(),
+                    message: "A filesystem write targets a recognized persistence location."
+                        .to_owned(),
+                    file: Some(path.to_owned()),
+                    line: Some(line),
+                    evidence: self
+                        .reachable
+                        .get(path)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .chain([format!("write target: {target}")])
+                        .collect(),
+                });
+            }
+            if contents
                 .label(&[Label::Remote, Label::DecodedRemote])
                 .is_some()
-        {
-            self.written.insert(
-                target,
-                contents
-                    .clone()
-                    .propagate(format!("write: {path}:{line} {name}")),
-            );
+            {
+                self.written.insert(
+                    target,
+                    contents
+                        .clone()
+                        .propagate(format!("write: {path}:{line} {name}")),
+                );
+            }
         }
         if matches!(
             normalized,
@@ -942,9 +1050,33 @@ fn sensitive_path(path: &str) -> bool {
         ".gitconfig",
         ".kube",
         ".docker",
+        ".mozilla",
+        "chrome/user data",
+        "brave",
+        "keychain",
+        "login data",
+        "cookies",
+        "1password",
+        "keepass",
         "wallet",
         "password",
     ]
     .iter()
     .any(|marker| path.to_ascii_lowercase().contains(marker))
+}
+
+fn persistence_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    [
+        "/etc/cron",
+        "/launchagents/",
+        "/systemd/user/",
+        "/.config/autostart/",
+        "/startup/",
+        "/.bashrc",
+        "/.zshrc",
+        "\\run\\",
+    ]
+    .iter()
+    .any(|marker| path.contains(marker))
 }

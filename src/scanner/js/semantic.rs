@@ -16,6 +16,7 @@ pub enum Capability {
     Process,
     Network,
     Secret,
+    FileRead,
     FileWrite,
     Chmod,
 }
@@ -78,6 +79,7 @@ pub fn collect(path: &str, source: &str, program: &Program<'_>) -> Collected {
         aliases: BTreeMap::new(),
         exceeded: false,
         current_function: None,
+        named_arrow_pending: false,
     };
     collector.visit_program(program);
     Collected {
@@ -98,6 +100,7 @@ struct Collector<'s> {
     aliases: BTreeMap<SymbolId, String>,
     exceeded: bool,
     current_function: Option<String>,
+    named_arrow_pending: bool,
 }
 
 impl Collector<'_> {
@@ -271,6 +274,7 @@ impl<'a> Visit<'a> for Collector<'_> {
             }
         }
         let previous = self.current_function.clone();
+        let previous_pending = self.named_arrow_pending;
         if matches!(variable.init, Some(Expression::ArrowFunctionExpression(_))) {
             self.current_function = match &variable.id {
                 oxc_ast::ast::BindingPattern::BindingIdentifier(binding) => {
@@ -278,9 +282,11 @@ impl<'a> Visit<'a> for Collector<'_> {
                 }
                 _ => Some("<anonymous>".to_owned()),
             };
+            self.named_arrow_pending = true;
         }
         walk::walk_variable_declarator(self, variable);
         self.current_function = previous;
+        self.named_arrow_pending = previous_pending;
     }
 
     fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
@@ -298,9 +304,10 @@ impl<'a> Visit<'a> for Collector<'_> {
 
     fn visit_arrow_function_expression(&mut self, function: &ArrowFunctionExpression<'a>) {
         let previous = self.current_function.clone();
-        if self.current_function.is_none() {
+        if !self.named_arrow_pending {
             self.current_function = Some("<anonymous>".to_owned());
         }
+        self.named_arrow_pending = false;
         walk::walk_arrow_function_expression(self, function);
         self.current_function = previous;
     }
@@ -402,12 +409,10 @@ fn capability(name: &str) -> Option<Capability> {
         "fetch" | "axios" | "axios.get" | "axios.post" | "http.request" | "https.request"
         | "node:http.request" | "node:https.request" | "got" | "request" | "undici.request"
         | "WebSocket" | "ws" | "net.Socket" | "tls.connect" => Some(Capability::Network),
-        "fs.readFile"
-        | "fs.readFileSync"
-        | "node:fs.readFile"
-        | "node:fs.readFileSync"
-        | "os.homedir"
-        | "node:os.homedir" => Some(Capability::Secret),
+        "fs.readFile" | "fs.readFileSync" | "node:fs.readFile" | "node:fs.readFileSync" => {
+            Some(Capability::FileRead)
+        }
+        "process.env" | "os.homedir" | "node:os.homedir" => Some(Capability::Secret),
         "fs.writeFile" | "fs.writeFileSync" | "node:fs.writeFile" | "node:fs.writeFileSync" => {
             Some(Capability::FileWrite)
         }

@@ -90,7 +90,7 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
     });
 
     files.append(&mut walk.other_records);
-    let graph = graph::build(&modules, &roots);
+    let graph = graph::build(&modules, &roots, &files);
     let flows = js::analyze_flows(&modules, &graph.reachable);
     append_limited(
         &mut findings,

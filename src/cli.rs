@@ -7,6 +7,9 @@ Pre-execution security scanner for untrusted source repositories
 Usage:
   preflightx <path> [--format terminal|json] [--fail-on <severity>]
   preflightx scan <path> [--format terminal|json] [--fail-on <severity>]
+  preflightx rules
+  preflightx rules show <rule-id>
+  preflightx explain <finding-id>
   preflightx --help
   preflightx --version
 
@@ -31,6 +34,8 @@ pub enum Command {
     Scan(ScanArgs),
     Help,
     Version,
+    Rules,
+    Rule(String),
 }
 
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
@@ -45,6 +50,22 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     if first == "--version" || first == "-V" {
         args.next();
         return no_extra(args, Command::Version);
+    }
+    if first == "rules" {
+        args.next();
+        return match args.next() {
+            None => Ok(Command::Rules),
+            Some(value) if value == "show" => {
+                let id = args.next().ok_or("rules show requires a rule ID")?;
+                no_extra(args, Command::Rule(id.to_string_lossy().into_owned()))
+            }
+            _ => Err("expected rules show <rule-id>".to_owned()),
+        };
+    }
+    if first == "explain" {
+        args.next();
+        let id = args.next().ok_or("explain requires a finding ID")?;
+        return no_extra(args, Command::Rule(id.to_string_lossy().into_owned()));
     }
     if first == "scan" {
         args.next();
