@@ -3,8 +3,9 @@ use crate::model::{Confidence, Finding, Severity};
 use crate::scanner::graph::resolve_import;
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, Declaration, ExportDefaultDeclarationKind,
-    Expression, ForStatementInit, ForStatementLeft, ImportDeclarationSpecifier, ModuleExportName,
-    ObjectPropertyKind, Program, PropertyKey, Statement, VariableDeclaration,
+    Expression, ForStatementInit, ForStatementLeft, ImportDeclarationSpecifier,
+    MethodDefinitionKind, MethodDefinitionType, ModuleExportName, ObjectPropertyKind, Program,
+    PropertyKey, Statement, VariableDeclaration,
 };
 use std::collections::BTreeMap;
 
@@ -47,6 +48,7 @@ pub enum Expr {
     Bool(bool),
     Member(Box<Expr>, String),
     Call(Box<Expr>, Vec<Expr>, u64),
+    Construct(Box<Expr>, Vec<Expr>, u64),
     Then(Box<Expr>, Binding, Vec<Stmt>),
     Message(Box<Expr>, Binding, Vec<Stmt>),
     Object(Vec<(String, Expr)>),
@@ -207,7 +209,7 @@ impl Lower<'_> {
                     self.line(call.span.start),
                 )
             }
-            Expression::NewExpression(call) => Expr::Call(
+            Expression::NewExpression(call) => Expr::Construct(
                 Box::new(self.expr(&call.callee)),
                 call.arguments
                     .iter()
@@ -346,6 +348,65 @@ impl Lower<'_> {
         Some(Function { params, body })
     }
 
+    fn class_functions(
+        &self,
+        class: &oxc_ast::ast::Class<'_>,
+        functions: &mut BTreeMap<String, Function>,
+    ) {
+        let Some(class_name) = class.id.as_ref().map(|id| id.name.to_string()) else {
+            return;
+        };
+        for element in &class.body.body {
+            let oxc_ast::ast::ClassElement::MethodDefinition(method) = element else {
+                continue;
+            };
+            if method.r#type != MethodDefinitionType::MethodDefinition {
+                continue;
+            }
+            let Some(method_name) = self.key(&method.key) else {
+                continue;
+            };
+            let name = if method.kind == MethodDefinitionKind::Constructor {
+                class_name.clone()
+            } else {
+                format!("{class_name}.{method_name}")
+            };
+            let params = method
+                .value
+                .params
+                .items
+                .iter()
+                .map(|item| self.binding(&item.pattern))
+                .collect();
+            let body = method
+                .value
+                .body
+                .as_ref()
+                .map(|body| self.statements(&body.statements, functions))
+                .unwrap_or_default();
+            functions.insert(name, Function { params, body });
+        }
+    }
+
+    fn object_functions(
+        &self,
+        name: &str,
+        object: &oxc_ast::ast::ObjectExpression<'_>,
+        functions: &mut BTreeMap<String, Function>,
+    ) {
+        for property in &object.properties {
+            let ObjectPropertyKind::ObjectProperty(property) = property else {
+                continue;
+            };
+            let Some(method) = self.key(&property.key) else {
+                continue;
+            };
+            if let Some(function) = self.function_expression(&property.value, functions) {
+                functions.insert(format!("{name}.{method}"), function);
+            }
+        }
+    }
+
     fn export_assignment(
         &self,
         left: &AssignmentTarget<'_>,
@@ -440,6 +501,10 @@ impl Lower<'_> {
                 Vec::new()
             }
             Declaration::VariableDeclaration(variable) => self.variables(variable, functions),
+            Declaration::ClassDeclaration(class) => {
+                self.class_functions(class, functions);
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
@@ -458,6 +523,11 @@ impl Lower<'_> {
                     && let Some(function) = self.function_expression(initializer, functions)
                 {
                     functions.insert(name.clone(), function);
+                }
+                if let (Binding::Name(name), Some(Expression::ObjectExpression(object))) =
+                    (&binding, &item.init)
+                {
+                    self.object_functions(name, object, functions);
                 }
                 Stmt::Bind(
                     binding,
@@ -491,7 +561,9 @@ impl Lower<'_> {
         functions: &mut BTreeMap<String, Function>,
     ) -> Vec<Stmt> {
         match statement {
-            Statement::FunctionDeclaration(_) | Statement::VariableDeclaration(_) => statement
+            Statement::FunctionDeclaration(_)
+            | Statement::VariableDeclaration(_)
+            | Statement::ClassDeclaration(_) => statement
                 .as_declaration()
                 .map(|declaration| self.declaration(declaration, functions))
                 .unwrap_or_default(),
@@ -682,6 +754,12 @@ pub fn lower(program: &Program<'_>, source: &str, line_offset: u64) -> ModuleFlo
                         }
                     }
                 }
+                Declaration::ClassDeclaration(class) => {
+                    if let Some(id) = &class.id {
+                        exports.insert(id.name.to_string(), id.name.to_string());
+                        lower.class_functions(class, &mut functions);
+                    }
+                }
                 _ => {}
             }
         } else if let Statement::ExportNamedDeclaration(export) = statement {
@@ -693,8 +771,19 @@ pub fn lower(program: &Program<'_>, source: &str, line_offset: u64) -> ModuleFlo
                     exports.insert(exported.to_owned(), local.to_owned());
                 }
             }
-        } else if let Statement::ExportDefaultDeclaration(_) = statement {
-            exports.insert("default".to_owned(), "default".to_owned());
+        } else if let Statement::ExportDefaultDeclaration(export) = statement {
+            if let ExportDefaultDeclarationKind::ClassDeclaration(class) = &export.declaration {
+                lower.class_functions(class, &mut functions);
+                exports.insert(
+                    "default".to_owned(),
+                    class
+                        .id
+                        .as_ref()
+                        .map_or_else(|| "default".to_owned(), |id| id.name.to_string()),
+                );
+            } else {
+                exports.insert("default".to_owned(), "default".to_owned());
+            }
         } else if let Statement::ExportFromDeclaration(export) = statement {
             for specifier in &export.specifiers {
                 if let (Some(local), Some(exported)) = (
@@ -1150,12 +1239,17 @@ impl Evaluator<'_> {
             Expr::Bool(_) => Value::default(),
             Expr::Member(object, property) => {
                 let base = self.eval(path, object, environment, depth);
-                let full_name = Some(
-                    base.name
-                        .as_ref()
-                        .map(|name| format!("{name}.{property}"))
-                        .unwrap_or_else(|| format!(".{property}")),
-                );
+                let receiver = base
+                    .name
+                    .as_ref()
+                    .cloned()
+                    .or_else(|| match object.as_ref() {
+                        Expr::Name(name) => Some(name.clone()),
+                        _ => None,
+                    });
+                let full_name = receiver
+                    .map(|name| format!("{name}.{property}"))
+                    .or_else(|| (!base.labels.is_empty()).then(|| format!("remote.{property}")));
                 if full_name.as_deref() == Some("process.env") {
                     let mut value = Value::labeled(
                         Label::EnvSecret,
@@ -1219,6 +1313,20 @@ impl Evaluator<'_> {
                     environment,
                     depth,
                 )
+            }
+            Expr::Construct(callee, arguments, line) => {
+                let constructor = self.eval(path, callee, environment, depth);
+                let args = arguments
+                    .iter()
+                    .map(|arg| self.eval(path, arg, environment, depth))
+                    .collect();
+                let name = constructor.name.as_deref().unwrap_or("");
+                let value = self.invoke(path, name, args, *line, environment, depth);
+                if value.name.is_none() && value.labels.is_empty() && value.fields.is_empty() {
+                    Value::named(name.to_owned())
+                } else {
+                    value
+                }
             }
             Expr::Then(receiver, parameter, body) => {
                 let value = self.eval(path, receiver, environment, depth);
@@ -1416,6 +1524,15 @@ impl Evaluator<'_> {
                 | "socket.io.emit"
                 | "http.response.write"
                 | "http.response.end"
+        ) {
+            self.exfiltration(path, line, name, &args);
+            return Value::default();
+        }
+        if matches!(
+            normalized,
+            "navigator.sendBeacon"
+                | "globalThis.navigator.sendBeacon"
+                | "window.navigator.sendBeacon"
         ) {
             self.exfiltration(path, line, name, &args);
             return Value::default();
@@ -1674,6 +1791,9 @@ impl Evaluator<'_> {
         mut scope: BTreeMap<String, Value>,
         depth: usize,
     ) -> Value {
+        if let Some((receiver, _)) = name.rsplit_once('.') {
+            scope.insert("this".to_owned(), Value::named(receiver.to_owned()));
+        }
         for (index, parameter) in function.params.iter().enumerate() {
             self.bind(
                 parameter,
@@ -1681,9 +1801,10 @@ impl Evaluator<'_> {
                 &mut scope,
             );
         }
-        self.run(path, &function.body, &mut scope, depth)
-            .unwrap_or_default()
-            .propagate(format!("return: {} {name}", self.file_path(path)))
+        let returned = self
+            .run(path, &function.body, &mut scope, depth)
+            .unwrap_or_default();
+        returned.propagate(format!("return: {} {name}", self.file_path(path)))
     }
 
     fn exported_function(
@@ -1703,6 +1824,17 @@ impl Evaluator<'_> {
                 && let Some(function) = module.flow.functions.get(local)
             {
                 return Some((id, local.clone(), function.clone()));
+            }
+            if let Some((object, method)) = exported.split_once('.') {
+                let local = module
+                    .flow
+                    .exports
+                    .get(object)
+                    .map_or(object, String::as_str);
+                let function_name = format!("{local}.{method}");
+                if let Some(function) = module.flow.functions.get(&function_name) {
+                    return Some((id, function_name, function.clone()));
+                }
             }
             let reexport = module
                 .flow
@@ -1764,6 +1896,7 @@ impl Evaluator<'_> {
 }
 
 fn sensitive_path(path: &str) -> bool {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
     [
         ".ssh",
         ".aws",
@@ -1774,18 +1907,33 @@ fn sensitive_path(path: &str) -> bool {
         ".kube",
         ".docker",
         ".mozilla",
+        "mozilla/firefox/profiles",
+        "firefox/profiles",
+        "logins.json",
+        "key4.db",
         "chrome/user data",
+        "google/chrome/user data",
+        "microsoft/edge/user data",
+        "chromium/user data",
         "brave",
         "keychain",
+        "keychains/",
         "login data",
         "cookies",
         "1password",
+        "bitwarden",
+        "lastpass",
+        ".password-store",
         "keepass",
         "wallet",
+        "metamask",
+        "exodus",
+        "electrum",
+        "wallet.dat",
         "password",
     ]
     .iter()
-    .any(|marker| path.to_ascii_lowercase().contains(marker))
+    .any(|marker| path.contains(marker))
 }
 
 fn persistence_path(path: &str) -> bool {

