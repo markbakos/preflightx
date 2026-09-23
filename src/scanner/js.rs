@@ -4,6 +4,9 @@ use oxc_parser::Parser;
 use oxc_span::SourceType;
 use std::path::Path;
 
+mod semantic;
+pub use semantic::{Capability, ModuleFacts};
+
 const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_NESTING: usize = 256;
 
@@ -11,6 +14,7 @@ pub struct JsAnalysis {
     pub language: Option<String>,
     pub findings: Vec<Finding>,
     pub incomplete_reasons: Vec<String>,
+    pub module: Option<ModuleFacts>,
 }
 
 pub fn analyze(path: &str, text: Option<&str>) -> JsAnalysis {
@@ -24,6 +28,7 @@ pub fn analyze(path: &str, text: Option<&str>) -> JsAnalysis {
         language: None,
         findings: Vec::new(),
         incomplete_reasons: Vec::new(),
+        module: None,
     };
     if !supported && !suspicious {
         return result;
@@ -83,6 +88,9 @@ pub fn analyze(path: &str, text: Option<&str>) -> JsAnalysis {
         }
         .to_owned(),
     );
+    let facts = semantic::collect(path, text, &parsed.program);
+    result.incomplete_reasons.extend(facts.incomplete_reasons);
+    result.module = facts.module;
     if !supported {
         result.findings.push(Finding {
             id: "FILE-PARSEABLE-JAVASCRIPT".to_owned(),
@@ -106,7 +114,7 @@ mod tests {
     #[test]
     fn parses_supported_javascript_and_typescript() {
         for path in ["a.js", "a.cjs", "a.mjs", "a.jsx"] {
-            let analysis = analyze(path, Some("export const value = 1;"));
+            let analysis = analyze(path, Some("const value = 1;"));
             assert_eq!(analysis.language.as_deref(), Some("javascript"), "{path}");
             assert!(analysis.incomplete_reasons.is_empty(), "{path}");
         }
@@ -138,5 +146,38 @@ mod tests {
         assert_eq!(oversized.incomplete_reasons.len(), 1);
         let nested = analyze("nested.js", Some(&"(".repeat(MAX_NESTING + 1)));
         assert_eq!(nested.incomplete_reasons.len(), 1);
+    }
+
+    #[test]
+    fn resolves_imported_aliases_and_computed_constructor_without_shadowing() {
+        let aliases = analyze(
+            "entry.js",
+            Some(
+                "import { exec as run } from 'node:child_process'; run('id'); global['Fun' + 'ction']('return 1')();",
+            ),
+        );
+        let module = aliases.module.unwrap();
+        assert!(
+            module
+                .calls
+                .iter()
+                .any(|call| call.name == "node:child_process.exec")
+        );
+        assert!(
+            module
+                .calls
+                .iter()
+                .any(|call| call.name == "global.Function")
+        );
+
+        let shadowed = analyze("entry.js", Some("function run(eval) { eval('text'); }"));
+        assert!(
+            shadowed
+                .module
+                .unwrap()
+                .calls
+                .iter()
+                .all(|call| call.capability.is_none())
+        );
     }
 }

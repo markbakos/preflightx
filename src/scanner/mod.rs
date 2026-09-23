@@ -1,5 +1,6 @@
 mod analyzers;
 mod classifier;
+mod graph;
 mod js;
 mod limits;
 mod raw;
@@ -15,6 +16,8 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
     let mut dependencies = Vec::new();
     let mut findings = Vec::new();
     let mut analyzer_incomplete = Vec::new();
+    let mut modules = Vec::new();
+    let mut roots = Vec::new();
 
     let mut walk = walker::walk(path, limits, |input| {
         let Some(bytes) = input.bytes else {
@@ -29,6 +32,14 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
             classifier::classify(&input.relative, &input.path, &input.metadata, &bytes);
         let metadata = analyzers::analyze(&input.relative, classification.text.as_deref());
         let javascript = js::analyze(&input.relative, classification.text.as_deref());
+        roots.extend(graph::roots(
+            &input.relative,
+            classification.text.as_deref(),
+            &classification.record.roles,
+        ));
+        if let Some(module) = javascript.module {
+            modules.push(module);
+        }
         classification.record.parsed_language = javascript.language;
         if !javascript.findings.is_empty() {
             classification
@@ -69,6 +80,15 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
     });
 
     files.append(&mut walk.other_records);
+    let graph = graph::build(&modules, &roots);
+    append_limited(
+        &mut findings,
+        graph.findings,
+        limits.max_findings,
+        "finding limit reached",
+        &mut analyzer_incomplete,
+    );
+    analyzer_incomplete.extend(graph.incomplete_reasons);
     append_limited(
         &mut findings,
         walk.findings,
@@ -127,6 +147,7 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
         files,
         dependencies,
         findings,
+        unresolved_edges: graph.unresolved,
         incomplete_reasons: walk.incomplete_reasons,
     }
 }

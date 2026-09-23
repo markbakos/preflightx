@@ -68,6 +68,62 @@ fn disguised_javascript_is_reported_and_bad_source_is_incomplete() {
 }
 
 #[test]
+fn build_config_import_elevates_fake_asset_with_process_execution() {
+    let root = temporary_directory("reachable-asset");
+    fs::write(
+        root.join("tailwind.config.js"),
+        b"require('./fake.svg'); module.exports = {};",
+    )
+    .unwrap();
+    fs::write(
+        root.join("fake.svg"),
+        b"const cp = require('child_process'); cp.exec('id');",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == "JS-REACHABLE-DISGUISED-SOURCE")
+        .unwrap();
+    assert_eq!(finding["severity"], "critical");
+    assert_eq!(finding["file"], "fake.svg");
+    assert!(
+        finding["evidence"]
+            .to_string()
+            .contains("tailwind.config.js")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unimported_fake_asset_is_not_elevated() {
+    let root = temporary_directory("unreachable-asset");
+    fs::write(
+        root.join("fake.svg"),
+        b"const cp = require('child_process'); cp.exec('id');",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| { finding["id"] != "JS-REACHABLE-DISGUISED-SOURCE" })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn incomplete_and_invalid_invocations_use_distinct_exit_codes() {
     let missing = run(&["definitely-does-not-exist"]);
     let invalid = run(&[".", "--online"]);

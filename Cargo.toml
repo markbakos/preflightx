@@ -9,7 +9,10 @@ publish = false
 infer = "0.22.0"
 json5 = "1.3.1"
 oxc_allocator = "0.151.0"
+oxc_ast = "0.151.0"
+oxc_ast_visit = "0.151.0"
 oxc_parser = "0.151.0"
+oxc_semantic = "0.151.0"
 oxc_span = "0.151.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

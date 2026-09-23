@@ -134,6 +134,7 @@ pub struct ScanReport {
     pub files: Vec<FileRecord>,
     pub dependencies: Vec<DependencyRecord>,
     pub findings: Vec<Finding>,
+    pub unresolved_edges: Vec<String>,
     pub incomplete_reasons: Vec<String>,
 }
 

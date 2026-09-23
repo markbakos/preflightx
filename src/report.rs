@@ -63,6 +63,13 @@ pub fn terminal(report: &ScanReport) -> String {
             "No significant malicious indicators were identified by this version of preflightx.",
         );
     }
+    if !report.unresolved_edges.is_empty() {
+        output.push('\n');
+        push_line(&mut output, "Unresolved execution edges:");
+        for edge in &report.unresolved_edges {
+            push_line(&mut output, &format!("  - {}", sanitize(edge)));
+        }
+    }
     output.push('\n');
     push_line(
         &mut output,
