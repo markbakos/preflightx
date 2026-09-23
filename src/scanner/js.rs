@@ -4,7 +4,9 @@ use oxc_parser::Parser;
 use oxc_span::SourceType;
 use std::path::Path;
 
+mod flow;
 mod semantic;
+pub use flow::analyze_flows;
 pub use semantic::{Capability, ModuleFacts};
 
 const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;

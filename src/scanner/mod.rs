@@ -18,6 +18,7 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
     let mut analyzer_incomplete = Vec::new();
     let mut modules = Vec::new();
     let mut roots = Vec::new();
+    let mut semantic_bytes = 0usize;
 
     let mut walk = walker::walk(path, limits, |input| {
         let Some(bytes) = input.bytes else {
@@ -38,7 +39,16 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
             &classification.record.roles,
         ));
         if let Some(module) = javascript.module {
-            modules.push(module);
+            let size = classification.text.as_ref().map_or(0, String::len);
+            if modules.len() >= 10_000 || semantic_bytes.saturating_add(size) > 64 * 1024 * 1024 {
+                analyzer_incomplete.push(format!(
+                    "JS/TS global semantic analysis limit reached before {}",
+                    input.relative
+                ));
+            } else {
+                semantic_bytes += size;
+                modules.push(module);
+            }
         }
         classification.record.parsed_language = javascript.language;
         if !javascript.findings.is_empty() {
@@ -81,6 +91,7 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
 
     files.append(&mut walk.other_records);
     let graph = graph::build(&modules, &roots);
+    let flows = js::analyze_flows(&modules, &graph.reachable);
     append_limited(
         &mut findings,
         graph.findings,
@@ -89,6 +100,14 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
         &mut analyzer_incomplete,
     );
     analyzer_incomplete.extend(graph.incomplete_reasons);
+    append_limited(
+        &mut findings,
+        flows.findings,
+        limits.max_findings,
+        "finding limit reached",
+        &mut analyzer_incomplete,
+    );
+    analyzer_incomplete.extend(flows.incomplete_reasons);
     append_limited(
         &mut findings,
         walk.findings,

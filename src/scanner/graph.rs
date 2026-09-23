@@ -17,6 +17,7 @@ pub struct GraphResult {
     pub findings: Vec<Finding>,
     pub unresolved: Vec<String>,
     pub incomplete_reasons: Vec<String>,
+    pub reachable: BTreeMap<String, Vec<String>>,
 }
 
 pub fn roots(path: &str, text: Option<&str>, roles: &[String]) -> Vec<Root> {
@@ -110,6 +111,25 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root]) -> GraphResult {
                 break;
             }
             if !import.specifier.starts_with('.') {
+                if !import.specifier.starts_with("node:")
+                    && !matches!(
+                        import.specifier.as_str(),
+                        "fs" | "os"
+                            | "path"
+                            | "http"
+                            | "https"
+                            | "vm"
+                            | "child_process"
+                            | "crypto"
+                            | "net"
+                            | "tls"
+                    )
+                {
+                    unresolved.push(format!(
+                        "{}:{} -> {} (external package not inspected)",
+                        module.path, import.line, import.specifier
+                    ));
+                }
                 continue;
             }
             match resolve_import(&module.path, &import.specifier, &by_path) {
@@ -158,6 +178,11 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root]) -> GraphResult {
                 continue;
             }
             let mut next = route.clone();
+            if next.len() >= 64 {
+                incomplete_reasons
+                    .push("JS/TS execution route depth limit of 64 reached".to_owned());
+                continue;
+            }
             next.push(format!("{source}:{line} imports {target}"));
             reachable.insert(target, next.clone());
             queue.push_back((target, next));
@@ -168,11 +193,31 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root]) -> GraphResult {
     for module in modules {
         let route = reachable.get(module.path.as_str());
         let disguised = !has_code_extension(&module.path);
+        let mut called_functions = std::collections::BTreeSet::new();
+        loop {
+            let previous = called_functions.len();
+            for call in &module.calls {
+                if call
+                    .function
+                    .as_ref()
+                    .is_none_or(|name| called_functions.contains(name))
+                    && let Some(name) = call.name.strip_prefix("local:")
+                {
+                    called_functions.insert(name.to_owned());
+                }
+            }
+            if called_functions.len() == previous {
+                break;
+            }
+        }
         let dangerous = module.calls.iter().find(|call| {
             matches!(
                 call.capability,
                 Some(Capability::DynamicCode | Capability::Process | Capability::Secret)
-            )
+            ) && call
+                .function
+                .as_ref()
+                .is_none_or(|name| called_functions.contains(name))
         });
         if disguised && let Some(route) = route {
             findings.push(Finding {
@@ -211,7 +256,8 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root]) -> GraphResult {
                 message: "This capability can execute code or a process; the call alone does not establish malicious intent.".to_owned(),
                 file: Some(module.path.clone()),
                 line: Some(call.line),
-                evidence: route.into_iter().flat_map(|route| route.iter().cloned()).chain([format!("call: {}", call.evidence)]).collect(),
+                evidence: route.filter(|_| call.function.as_ref().is_none_or(|name| called_functions.contains(name)))
+                    .into_iter().flat_map(|route| route.iter().cloned()).chain([format!("call: {}", call.evidence)]).collect(),
             });
         }
     }
@@ -221,6 +267,10 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root]) -> GraphResult {
         findings,
         unresolved,
         incomplete_reasons,
+        reachable: reachable
+            .into_iter()
+            .map(|(path, route)| (path.to_owned(), route))
+            .collect(),
     }
 }
 
@@ -248,7 +298,7 @@ fn resolve_from(from: &str, specifier: &str) -> String {
     components.join("/")
 }
 
-fn resolve_import<'a>(
+pub(super) fn resolve_import<'a>(
     from: &str,
     specifier: &str,
     modules: &BTreeMap<&'a str, &'a ModuleFacts>,

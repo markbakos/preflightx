@@ -1,10 +1,10 @@
 use oxc_ast::ast::{
-    Argument, CallExpression, ComputedMemberExpression, Expression, ImportDeclaration,
-    ImportDeclarationSpecifier, ImportExpression, NewExpression, Program, StaticMemberExpression,
-    VariableDeclarator,
+    Argument, ArrowFunctionExpression, CallExpression, ComputedMemberExpression, Expression,
+    Function, ImportDeclaration, ImportDeclarationSpecifier, ImportExpression, NewExpression,
+    Program, StaticMemberExpression, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
-use oxc_semantic::{Scoping, SemanticBuilder, SymbolId};
+use oxc_semantic::{ScopeFlags, Scoping, SemanticBuilder, SymbolId};
 use oxc_span::Span;
 use std::collections::BTreeMap;
 
@@ -26,6 +26,7 @@ pub struct CallFact {
     pub line: u64,
     pub evidence: String,
     pub capability: Option<Capability>,
+    pub function: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +40,7 @@ pub struct ModuleFacts {
     pub path: String,
     pub imports: Vec<ImportFact>,
     pub calls: Vec<CallFact>,
+    pub flow: super::flow::ModuleFlow,
 }
 
 pub struct Collected {
@@ -68,12 +70,14 @@ pub fn collect(path: &str, source: &str, program: &Program<'_>) -> Collected {
             path: path.to_owned(),
             imports: Vec::new(),
             calls: Vec::new(),
+            flow: super::flow::lower(program, source),
         },
         source,
         lines,
         scoping: result.semantic.scoping(),
         aliases: BTreeMap::new(),
         exceeded: false,
+        current_function: None,
     };
     collector.visit_program(program);
     Collected {
@@ -93,6 +97,7 @@ struct Collector<'s> {
     scoping: &'s Scoping,
     aliases: BTreeMap<SymbolId, String>,
     exceeded: bool,
+    current_function: Option<String>,
 }
 
 impl Collector<'_> {
@@ -131,6 +136,7 @@ impl Collector<'_> {
             name,
             line: self.line(span),
             evidence: self.snippet(span),
+            function: self.current_function.clone(),
         });
     }
 
@@ -163,6 +169,11 @@ impl Collector<'_> {
                 static_string(&member.expression)?
             )),
             Expression::ParenthesizedExpression(expression) => self.name(&expression.expression),
+            Expression::CallExpression(call)
+                if self.name(&call.callee).as_deref() == Some("require") =>
+            {
+                call.arguments.first().and_then(argument_string)
+            }
             Expression::ChainExpression(expression) => match &expression.expression {
                 oxc_ast::ast::ChainElement::CallExpression(call) => self.name(&call.callee),
                 _ => None,
@@ -234,7 +245,64 @@ impl<'a> Visit<'a> for Collector<'_> {
                 self.imported_binding(binding.symbol_id.get(), alias);
             }
         }
+        if let (
+            Some(Expression::CallExpression(call)),
+            oxc_ast::ast::BindingPattern::ObjectPattern(pattern),
+        ) = (&variable.init, &variable.id)
+            && self.name(&call.callee).as_deref() == Some("require")
+            && let Some(specifier) = call.arguments.first().and_then(argument_string)
+        {
+            for property in &pattern.properties {
+                if let oxc_ast::ast::BindingPattern::BindingIdentifier(binding) = &property.value {
+                    let name = match &property.key {
+                        oxc_ast::ast::PropertyKey::StaticIdentifier(name) => {
+                            Some(name.name.as_str())
+                        }
+                        oxc_ast::ast::PropertyKey::StringLiteral(name) => Some(name.value.as_str()),
+                        _ => None,
+                    };
+                    if let Some(name) = name {
+                        self.imported_binding(
+                            binding.symbol_id.get(),
+                            format!("{specifier}.{name}"),
+                        );
+                    }
+                }
+            }
+        }
+        let previous = self.current_function.clone();
+        if matches!(variable.init, Some(Expression::ArrowFunctionExpression(_))) {
+            self.current_function = match &variable.id {
+                oxc_ast::ast::BindingPattern::BindingIdentifier(binding) => {
+                    Some(binding.name.to_string())
+                }
+                _ => Some("<anonymous>".to_owned()),
+            };
+        }
         walk::walk_variable_declarator(self, variable);
+        self.current_function = previous;
+    }
+
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        let previous = self.current_function.clone();
+        self.current_function = Some(
+            function
+                .id
+                .as_ref()
+                .map(|id| id.name.to_string())
+                .unwrap_or_else(|| "<anonymous>".to_owned()),
+        );
+        walk::walk_function(self, function, flags);
+        self.current_function = previous;
+    }
+
+    fn visit_arrow_function_expression(&mut self, function: &ArrowFunctionExpression<'a>) {
+        let previous = self.current_function.clone();
+        if self.current_function.is_none() {
+            self.current_function = Some("<anonymous>".to_owned());
+        }
+        walk::walk_arrow_function_expression(self, function);
+        self.current_function = previous;
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
@@ -286,7 +354,7 @@ fn argument_string(argument: &Argument<'_>) -> Option<String> {
     }
 }
 
-fn static_string(expression: &Expression<'_>) -> Option<String> {
+pub(super) fn static_string(expression: &Expression<'_>) -> Option<String> {
     match expression {
         Expression::StringLiteral(value) => Some(value.value.to_string()),
         Expression::BinaryExpression(binary)
