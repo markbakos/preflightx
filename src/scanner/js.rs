@@ -42,9 +42,19 @@ pub fn analyze(path: &str, text: Option<&str>) -> JsAnalysis {
             "var ",
             "function ",
             "async ",
+            "await ",
             "class ",
             "import ",
             "export ",
+            "if ",
+            "if(",
+            "for ",
+            "for(",
+            "while ",
+            "try ",
+            "switch ",
+            "throw ",
+            "new ",
             "module.",
             "exports.",
             "require(",
@@ -53,7 +63,13 @@ pub fn analyze(path: &str, text: Option<&str>) -> JsAnalysis {
             "global",
             "process.",
             "fetch(",
+            "axios",
+            "http.",
+            "https.",
+            "WebSocket",
+            "console.",
             "setTimeout(",
+            "setInterval(",
             "(",
             "\"use strict\"",
             "'use strict'",
@@ -219,6 +235,11 @@ mod tests {
 
         let disguised = analyze("payload.md", Some("const payload = 1; function run() {}"));
         assert_eq!(disguised.language.as_deref(), Some("javascript"));
+        let disguised_statement = analyze(
+            "payload.data",
+            Some("if (enabled) { const cp = require('child_process'); eval('payload'); }"),
+        );
+        assert_eq!(disguised_statement.language.as_deref(), Some("javascript"));
     }
 
     #[test]
