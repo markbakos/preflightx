@@ -1780,6 +1780,11 @@ impl Evaluator<'_> {
             || normalized.ends_with(".text")
             || normalized.ends_with(".buffer")
             || normalized.ends_with(".arrayBuffer")
+            || normalized.ends_with(".blob")
+            || normalized.ends_with(".formData")
+            || normalized.ends_with(".bytes")
+            || normalized.ends_with(".clone")
+            || normalized.ends_with(".get")
             || normalized == "Buffer.concat"
             || normalized.ends_with(".concat")
             || normalized.ends_with(".replace")

