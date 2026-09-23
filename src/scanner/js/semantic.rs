@@ -9,7 +9,7 @@ use oxc_semantic::{ScopeFlags, Scoping, SemanticBuilder, SymbolId};
 use oxc_span::Span;
 use std::collections::BTreeMap;
 
-const MAX_FACTS: usize = 50_000;
+pub const MAX_FACTS_PER_FILE: usize = 50_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Capability {
@@ -39,7 +39,10 @@ pub struct ImportFact {
 
 #[derive(Clone, Debug)]
 pub struct ModuleFacts {
+    pub id: String,
     pub path: String,
+    pub flow_enabled: bool,
+    pub source_bytes: usize,
     pub imports: Vec<ImportFact>,
     pub calls: Vec<CallFact>,
     pub flow: super::flow::ModuleFlow,
@@ -50,7 +53,15 @@ pub struct Collected {
     pub incomplete_reasons: Vec<String>,
 }
 
-pub fn collect(path: &str, source: &str, program: &Program<'_>) -> Collected {
+pub fn collect(
+    path: &str,
+    id: &str,
+    source: &str,
+    program: &Program<'_>,
+    line_offset: u64,
+    flow_enabled: bool,
+    fact_limit: usize,
+) -> Collected {
     let result = SemanticBuilder::new_compiler()
         .with_build_nodes(true)
         .with_check_syntax_error(true)
@@ -69,16 +80,21 @@ pub fn collect(path: &str, source: &str, program: &Program<'_>) -> Collected {
         .collect();
     let mut collector = Collector {
         module: ModuleFacts {
+            id: id.to_owned(),
             path: path.to_owned(),
+            flow_enabled,
+            source_bytes: source.len(),
             imports: Vec::new(),
             calls: Vec::new(),
-            flow: super::flow::lower(program, source),
+            flow: super::flow::lower(program, source, line_offset),
         },
         source,
+        line_offset,
         lines,
         scoping: result.semantic.scoping(),
         aliases: BTreeMap::new(),
         exceeded: false,
+        fact_limit,
         current_function: None,
         named_arrow_pending: false,
     };
@@ -86,7 +102,7 @@ pub fn collect(path: &str, source: &str, program: &Program<'_>) -> Collected {
     Collected {
         module: Some(collector.module),
         incomplete_reasons: if collector.exceeded {
-            vec![format!("JS/TS fact limit of {MAX_FACTS} reached: {path}")]
+            vec![format!("JS/TS fact limit of {fact_limit} reached: {path}")]
         } else {
             Vec::new()
         },
@@ -96,18 +112,22 @@ pub fn collect(path: &str, source: &str, program: &Program<'_>) -> Collected {
 struct Collector<'s> {
     module: ModuleFacts,
     source: &'s str,
+    line_offset: u64,
     lines: Vec<usize>,
     scoping: &'s Scoping,
     aliases: BTreeMap<SymbolId, String>,
     exceeded: bool,
+    fact_limit: usize,
     current_function: Option<String>,
     named_arrow_pending: bool,
 }
 
 impl Collector<'_> {
     fn line(&self, span: Span) -> u64 {
-        self.lines
-            .partition_point(|offset| *offset <= span.start as usize) as u64
+        self.line_offset
+            + self
+                .lines
+                .partition_point(|offset| *offset <= span.start as usize) as u64
     }
 
     fn snippet(&self, span: Span) -> String {
@@ -120,7 +140,7 @@ impl Collector<'_> {
     }
 
     fn push_import(&mut self, specifier: &str, span: Span) {
-        if self.module.imports.len() + self.module.calls.len() >= MAX_FACTS {
+        if self.module.imports.len() + self.module.calls.len() >= self.fact_limit {
             self.exceeded = true;
             return;
         }
@@ -131,7 +151,7 @@ impl Collector<'_> {
     }
 
     fn push_call(&mut self, name: String, span: Span) {
-        if self.module.imports.len() + self.module.calls.len() >= MAX_FACTS {
+        if self.module.imports.len() + self.module.calls.len() >= self.fact_limit {
             self.exceeded = true;
             return;
         }

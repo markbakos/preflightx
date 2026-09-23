@@ -3,8 +3,8 @@ use crate::model::{Confidence, Finding, Severity};
 use crate::scanner::graph::resolve_import;
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, Declaration, ExportDefaultDeclarationKind,
-    Expression, ImportDeclarationSpecifier, ModuleExportName, ObjectPropertyKind, Program,
-    PropertyKey, Statement,
+    Expression, ForStatementInit, ForStatementLeft, ImportDeclarationSpecifier, ModuleExportName,
+    ObjectPropertyKind, Program, PropertyKey, Statement, VariableDeclaration,
 };
 use std::collections::BTreeMap;
 
@@ -37,6 +37,7 @@ pub enum Stmt {
     Expr(Expr),
     Return(Expr),
     Branch(Expr, Vec<Stmt>, Vec<Stmt>),
+    Iterate(Binding, Expr, Vec<Stmt>),
 }
 
 #[derive(Clone, Debug)]
@@ -56,16 +57,19 @@ pub enum Expr {
 
 struct Lower<'a> {
     source: &'a str,
+    line_offset: u64,
 }
 
 impl Lower<'_> {
     fn line(&self, offset: u32) -> u64 {
-        self.source
-            .get(..offset as usize)
-            .unwrap_or_default()
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count() as u64
+        self.line_offset
+            + self
+                .source
+                .get(..offset as usize)
+                .unwrap_or_default()
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count() as u64
             + 1
     }
 
@@ -131,13 +135,10 @@ impl Lower<'_> {
                 Box::new(self.expr(&member.object)),
                 member.property.name.to_string(),
             ),
-            Expression::ComputedMemberExpression(member) => {
-                if let Some(property) = static_string(&member.expression) {
-                    Expr::Member(Box::new(self.expr(&member.object)), property)
-                } else {
-                    Expr::Unknown
-                }
-            }
+            Expression::ComputedMemberExpression(member) => Expr::Member(
+                Box::new(self.expr(&member.object)),
+                static_string(&member.expression).unwrap_or_else(|| "*".to_owned()),
+            ),
             Expression::CallExpression(call) => {
                 if let Expression::StaticMemberExpression(member) = &call.callee
                     && member.property.name == "then"
@@ -438,26 +439,49 @@ impl Lower<'_> {
                 }
                 Vec::new()
             }
-            Declaration::VariableDeclaration(variable) => variable
-                .declarations
-                .iter()
-                .map(|item| {
-                    let binding = self.binding(&item.id);
-                    if let (Binding::Name(name), Some(initializer)) = (&binding, &item.init)
-                        && let Some(function) = self.function_expression(initializer, functions)
-                    {
-                        functions.insert(name.clone(), function);
-                    }
-                    Stmt::Bind(
-                        binding,
-                        item.init
-                            .as_ref()
-                            .map(|expr| self.expr(expr))
-                            .unwrap_or(Expr::Unknown),
-                    )
-                })
-                .collect(),
+            Declaration::VariableDeclaration(variable) => self.variables(variable, functions),
             _ => Vec::new(),
+        }
+    }
+
+    fn variables(
+        &self,
+        variable: &VariableDeclaration<'_>,
+        functions: &mut BTreeMap<String, Function>,
+    ) -> Vec<Stmt> {
+        variable
+            .declarations
+            .iter()
+            .map(|item| {
+                let binding = self.binding(&item.id);
+                if let (Binding::Name(name), Some(initializer)) = (&binding, &item.init)
+                    && let Some(function) = self.function_expression(initializer, functions)
+                {
+                    functions.insert(name.clone(), function);
+                }
+                Stmt::Bind(
+                    binding,
+                    item.init
+                        .as_ref()
+                        .map(|expr| self.expr(expr))
+                        .unwrap_or(Expr::Unknown),
+                )
+            })
+            .collect()
+    }
+
+    fn loop_binding(&self, left: &ForStatementLeft<'_>) -> Binding {
+        match left {
+            ForStatementLeft::VariableDeclaration(variable) => variable
+                .declarations
+                .first()
+                .map(|declaration| self.binding(&declaration.id))
+                .unwrap_or(Binding::Ignore),
+            _ => left
+                .as_assignment_target()
+                .and_then(AssignmentTarget::get_identifier_name)
+                .map(|name| Binding::Name(name.to_owned()))
+                .unwrap_or(Binding::Ignore),
         }
     }
 
@@ -545,7 +569,7 @@ impl Lower<'_> {
                     .map(|alternate| self.statement(alternate, functions))
                     .unwrap_or_default(),
             )],
-            // ponytail: One loop pass catches direct sinks; add a bounded fixpoint when loop-carried flows are needed.
+            // ponytail: One pass catches direct loop sinks; loop-carried fixpoints remain the known ceiling.
             Statement::WhileStatement(loop_) => vec![Stmt::Branch(
                 self.expr(&loop_.test),
                 self.statement(&loop_.body, functions),
@@ -553,11 +577,24 @@ impl Lower<'_> {
             )],
             Statement::DoWhileStatement(loop_) => self.statement(&loop_.body, functions),
             Statement::ForStatement(loop_) => {
+                let mut statements = loop_
+                    .init
+                    .as_ref()
+                    .map(|init| match init {
+                        ForStatementInit::VariableDeclaration(variable) => {
+                            self.variables(variable, functions)
+                        }
+                        _ => init
+                            .as_expression()
+                            .map(|expression| vec![Stmt::Expr(self.expr(expression))])
+                            .unwrap_or_default(),
+                    })
+                    .unwrap_or_default();
                 let mut body = self.statement(&loop_.body, functions);
                 if let Some(update) = &loop_.update {
                     body.push(Stmt::Expr(self.expr(update)));
                 }
-                vec![Stmt::Branch(
+                statements.push(Stmt::Branch(
                     loop_
                         .test
                         .as_ref()
@@ -565,6 +602,34 @@ impl Lower<'_> {
                         .unwrap_or(Expr::Bool(true)),
                     body,
                     Vec::new(),
+                ));
+                statements
+            }
+            Statement::ForInStatement(loop_) => vec![Stmt::Iterate(
+                self.loop_binding(&loop_.left),
+                self.expr(&loop_.right),
+                self.statement(&loop_.body, functions),
+            )],
+            Statement::ForOfStatement(loop_) => vec![Stmt::Iterate(
+                self.loop_binding(&loop_.left),
+                self.expr(&loop_.right),
+                self.statement(&loop_.body, functions),
+            )],
+            Statement::SwitchStatement(switch_) => {
+                let mut cases = switch_
+                    .cases
+                    .iter()
+                    .map(|case| self.statements(&case.consequent, functions));
+                let Some(mut combined) = cases.next() else {
+                    return Vec::new();
+                };
+                for case in cases {
+                    combined = vec![Stmt::Branch(Expr::Unknown, combined, case)];
+                }
+                vec![Stmt::Branch(
+                    Expr::Unknown,
+                    combined,
+                    vec![Stmt::Expr(self.expr(&switch_.discriminant))],
                 )]
             }
             Statement::TryStatement(try_) => {
@@ -593,8 +658,11 @@ fn argument_text<'a>(argument: &'a Argument<'_>) -> Option<&'a str> {
     }
 }
 
-pub fn lower(program: &Program<'_>, source: &str) -> ModuleFlow {
-    let lower = Lower { source };
+pub fn lower(program: &Program<'_>, source: &str, line_offset: u64) -> ModuleFlow {
+    let lower = Lower {
+        source,
+        line_offset,
+    };
     let mut imports = BTreeMap::new();
     let mut exports = BTreeMap::new();
     let mut reexports = BTreeMap::new();
@@ -826,6 +894,7 @@ pub struct FlowResult {
 
 struct Evaluator<'a> {
     modules: BTreeMap<&'a str, &'a ModuleFacts>,
+    by_path: BTreeMap<&'a str, &'a ModuleFacts>,
     reachable: &'a BTreeMap<String, Vec<String>>,
     findings: Vec<Finding>,
     seen: std::collections::BTreeSet<(String, String, u64)>,
@@ -841,11 +910,16 @@ pub fn analyze_flows(
     modules: &[ModuleFacts],
     reachable: &BTreeMap<String, Vec<String>>,
 ) -> FlowResult {
+    let mut by_path = BTreeMap::new();
+    for module in modules {
+        by_path.entry(module.path.as_str()).or_insert(module);
+    }
     let mut evaluator = Evaluator {
         modules: modules
             .iter()
-            .map(|module| (module.path.as_str(), module))
+            .map(|module| (module.id.as_str(), module))
             .collect(),
+        by_path,
         reachable,
         findings: Vec::new(),
         seen: std::collections::BTreeSet::new(),
@@ -857,12 +931,14 @@ pub fn analyze_flows(
         if evaluator.limited {
             break;
         }
-        if !reachable.is_empty() && !reachable.contains_key(module.path.as_str()) {
+        if !module.flow_enabled
+            || (!reachable.is_empty() && !reachable.contains_key(module.id.as_str()))
+        {
             continue;
         }
         evaluator.written.clear();
         let mut environment = evaluator.imports(module);
-        evaluator.run(&module.path, &module.flow.body, &mut environment, 0);
+        evaluator.run(&module.id, &module.flow.body, &mut environment, 0);
     }
     let remote = evaluator
         .findings
@@ -882,20 +958,12 @@ pub fn analyze_flows(
         .cloned()
         .collect::<Vec<_>>();
     for execution in remote {
+        let trigger = execution
+            .evidence
+            .iter()
+            .find(|item| item.starts_with("trigger:") && *item != "trigger: unresolved");
         let same_route = secrets.iter().find(|secret| {
-            execution
-                .file
-                .as_ref()
-                .and_then(|file| reachable.get(file))
-                .and_then(|route| route.first())
-                .is_some_and(|trigger| {
-                    secret
-                        .file
-                        .as_ref()
-                        .and_then(|file| reachable.get(file))
-                        .and_then(|route| route.first())
-                        == Some(trigger)
-                })
+            trigger.is_some_and(|trigger| secret.evidence.iter().any(|item| item == trigger))
         });
         if let Some(secret) = same_route {
             evaluator.findings.push(Finding {
@@ -924,6 +992,19 @@ pub fn analyze_flows(
 }
 
 impl Evaluator<'_> {
+    fn file_path<'a>(&'a self, id: &'a str) -> &'a str {
+        self.modules
+            .get(id)
+            .map_or(id, |module| module.path.as_str())
+    }
+
+    fn route(&self, id: &str) -> Vec<String> {
+        self.reachable
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| vec!["trigger: unresolved".to_owned()])
+    }
+
     fn imports(&self, module: &ModuleFacts) -> BTreeMap<String, Value> {
         module
             .flow
@@ -1001,6 +1082,19 @@ impl Evaluator<'_> {
                         return pending_return;
                     }
                 }
+                Stmt::Iterate(binding, iterable, body) => {
+                    let mut iteration = environment.clone();
+                    let value = self.eval(path, iterable, environment, depth);
+                    self.bind(binding, value, &mut iteration);
+                    if let Some(value) = self.run(path, body, &mut iteration, depth + 1) {
+                        pending_return
+                            .get_or_insert_with(Value::default)
+                            .merge(value);
+                    }
+                    for (name, value) in iteration {
+                        environment.entry(name).or_default().merge(value);
+                    }
+                }
             }
         }
         pending_return
@@ -1023,8 +1117,13 @@ impl Evaluator<'_> {
                 }
             }
             Binding::Array(items) => {
-                for nested in items {
-                    self.bind(nested, value.clone(), environment);
+                for (index, nested) in items.iter().enumerate() {
+                    let selected = value
+                        .fields
+                        .get(&index.to_string())
+                        .cloned()
+                        .unwrap_or_else(|| value.clone());
+                    self.bind(nested, selected, environment);
                 }
             }
             Binding::Ignore => {}
@@ -1041,6 +1140,7 @@ impl Evaluator<'_> {
         if self.limited {
             return Value::default();
         }
+        let file_path = self.file_path(path).to_owned();
         match expression {
             Expr::Name(name) => environment
                 .get(name)
@@ -1057,8 +1157,10 @@ impl Evaluator<'_> {
                         .unwrap_or_else(|| format!(".{property}")),
                 );
                 if full_name.as_deref() == Some("process.env") {
-                    let mut value =
-                        Value::labeled(Label::EnvSecret, format!("source: {path} process.env"));
+                    let mut value = Value::labeled(
+                        Label::EnvSecret,
+                        format!("source: {file_path} process.env"),
+                    );
                     value.name = full_name;
                     return value;
                 }
@@ -1174,9 +1276,12 @@ impl Evaluator<'_> {
             if let Some(import) = name.strip_prefix("import:")
                 && let Some((specifier, exported)) = import.rsplit_once('#')
                 && specifier.starts_with('.')
-                && let Some(target) = resolve_import(path, specifier, &self.modules)
-                && let Some((target, local, function)) =
-                    self.exported_function(target, exported.strip_prefix("*.").unwrap_or(exported))
+                && let Some(target_path) = resolve_import(&module.path, specifier, &self.by_path)
+                && let Some(target_module) = self.by_path.get(target_path)
+                && let Some((target, local, function)) = self.exported_function(
+                    &target_module.id,
+                    exported.strip_prefix("*.").unwrap_or(exported),
+                )
             {
                 let scope = self.imports(self.modules[target.as_str()]);
                 return self.call_function(&target, &local, &function, args, scope, depth + 1);
@@ -1200,7 +1305,27 @@ impl Evaluator<'_> {
             .unwrap_or_else(|| name.to_owned());
         let name = name.as_str();
         let normalized = name.strip_prefix("node:").unwrap_or(name);
-        let source = format!("source: {path}:{line} {name}");
+        let file_path = self.file_path(path).to_owned();
+        let source = format!("source: {file_path}:{line} {name}");
+        if normalized == "Object.keys" {
+            return Value::default();
+        }
+        if normalized == "Object.entries" {
+            let mut entries = Value::default();
+            if let Some(value) = args.first() {
+                entries.merge(value.clone());
+                let mut key = Value::named("object key".to_owned());
+                if value
+                    .label(&[Label::Remote, Label::DecodedRemote])
+                    .is_some()
+                {
+                    key.merge(value.clone());
+                }
+                entries.fields.insert("0".to_owned(), key);
+                entries.fields.insert("1".to_owned(), value.clone());
+            }
+            return entries.propagate(format!("transform: {file_path}:{line} {name}"));
+        }
         if matches!(
             normalized,
             "axios"
@@ -1355,7 +1480,7 @@ impl Evaluator<'_> {
                 let route = output.labels.remove(&Label::Remote).unwrap();
                 output.labels.insert(Label::DecodedRemote, route);
             }
-            return output.propagate(format!("decode: {path}:{line} {name}"));
+            return output.propagate(format!("decode: {file_path}:{line} {name}"));
         }
         if matches!(
             normalized,
@@ -1376,12 +1501,13 @@ impl Evaluator<'_> {
             || normalized.ends_with(".toLowerCase")
             || normalized.ends_with(".toUpperCase")
             || normalized.ends_with(".trim")
+            || matches!(normalized, "Object.values")
         {
             return args
                 .first()
                 .cloned()
                 .unwrap_or_default()
-                .propagate(format!("transform: {path}:{line} {name}"));
+                .propagate(format!("transform: {file_path}:{line} {name}"));
         }
         if normalized == "fs.createWriteStream" {
             let mut stream = Value::named("file-stream".to_owned());
@@ -1401,7 +1527,7 @@ impl Evaluator<'_> {
                 target,
                 contents
                     .clone()
-                    .propagate(format!("stream write: {path}:{line} {name}")),
+                    .propagate(format!("stream write: {file_path}:{line} {name}")),
             );
         }
         if matches!(
@@ -1420,13 +1546,10 @@ impl Evaluator<'_> {
                     title: "JavaScript writes to an automatic startup location".to_owned(),
                     message: "A filesystem write targets a recognized persistence location."
                         .to_owned(),
-                    file: Some(path.to_owned()),
+                    file: Some(file_path.clone()),
                     line: Some(line),
                     evidence: self
-                        .reachable
-                        .get(path)
-                        .cloned()
-                        .unwrap_or_default()
+                        .route(path)
                         .into_iter()
                         .chain([format!("write target: {target}")])
                         .collect(),
@@ -1440,7 +1563,7 @@ impl Evaluator<'_> {
                     target,
                     contents
                         .clone()
-                        .propagate(format!("write: {path}:{line} {name}")),
+                        .propagate(format!("write: {file_path}:{line} {name}")),
                 );
             }
         }
@@ -1452,7 +1575,7 @@ impl Evaluator<'_> {
         {
             *written = written
                 .clone()
-                .propagate(format!("chmod: {path}:{line} {name}"));
+                .propagate(format!("chmod: {file_path}:{line} {name}"));
         }
         if matches!(
             normalized,
@@ -1502,13 +1625,10 @@ impl Evaluator<'_> {
                     title: "JavaScript invokes an automatic-startup command".to_owned(),
                     message: "A process execution API receives a recognized persistence command."
                         .to_owned(),
-                    file: Some(path.to_owned()),
+                    file: Some(file_path.clone()),
                     line: Some(line),
                     evidence: self
-                        .reachable
-                        .get(path)
-                        .cloned()
-                        .unwrap_or_default()
+                        .route(path)
                         .into_iter()
                         .chain([format!("command: {command}")])
                         .collect(),
@@ -1563,7 +1683,7 @@ impl Evaluator<'_> {
         }
         self.run(path, &function.body, &mut scope, depth)
             .unwrap_or_default()
-            .propagate(format!("return: {path} {name}"))
+            .propagate(format!("return: {} {name}", self.file_path(path)))
     }
 
     fn exported_function(
@@ -1571,18 +1691,18 @@ impl Evaluator<'_> {
         path: &str,
         exported: &str,
     ) -> Option<(String, String, Function)> {
-        let mut path = path.to_owned();
+        let mut id = path.to_owned();
         let mut exported = if exported == "*" {
             "default".to_owned()
         } else {
             exported.to_owned()
         };
         for _ in 0..MAX_CALL_DEPTH {
-            let module = self.modules.get(path.as_str())?;
+            let module = self.modules.get(id.as_str())?;
             if let Some(local) = module.flow.exports.get(&exported)
                 && let Some(function) = module.flow.functions.get(local)
             {
-                return Some((path, local.clone(), function.clone()));
+                return Some((id, local.clone(), function.clone()));
             }
             let reexport = module
                 .flow
@@ -1595,7 +1715,8 @@ impl Evaluator<'_> {
                         .flatten()
                         .map(|(specifier, _)| (specifier.clone(), exported.clone()))
                 })?;
-            path = resolve_import(&path, &reexport.0, &self.modules)?.to_owned();
+            let target = resolve_import(&module.path, &reexport.0, &self.by_path)?;
+            id = self.by_path.get(target)?.id.clone();
             exported = reexport.1;
         }
         self.limited = true;
@@ -1620,13 +1741,10 @@ impl Evaluator<'_> {
         if !self.seen.insert((id.to_owned(), path.to_owned(), line)) {
             return;
         }
-        let mut evidence = self
-            .reachable
-            .get(path)
-            .cloned()
-            .unwrap_or_else(|| vec!["trigger: unresolved".to_owned()]);
+        let mut evidence = self.route(path);
         evidence.extend(route.iter().cloned());
-        evidence.push(format!("sink: {path}:{line} {sink}"));
+        let file_path = self.file_path(path).to_owned();
+        evidence.push(format!("sink: {file_path}:{line} {sink}"));
         self.findings.push(Finding {
             id: id.to_owned(),
             severity: Severity::Critical,
@@ -1638,7 +1756,7 @@ impl Evaluator<'_> {
             score,
             title: title.to_owned(),
             message: impact.to_owned(),
-            file: Some(path.to_owned()),
+            file: Some(file_path),
             line: Some(line),
             evidence,
         });

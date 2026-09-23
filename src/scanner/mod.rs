@@ -54,8 +54,22 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
             }
             roots.extend(root_analysis.roots.into_iter().take(available));
         }
-        if let Some(module) = javascript.module {
-            let size = classification.text.as_ref().map_or(0, String::len);
+        for embedded in javascript.embedded_roots {
+            if roots.len() == graph::MAX_EXECUTION_ROOTS {
+                analyzer_incomplete.push(format!(
+                    "JS/TS global execution root limit of {} reached; embedded scripts omitted",
+                    graph::MAX_EXECUTION_ROOTS
+                ));
+                break;
+            }
+            roots.push(graph::Root {
+                file: embedded.module_id,
+                trigger: format!("inline script in HTML document {}", input.relative),
+                line: Some(embedded.line),
+            });
+        }
+        for module in javascript.modules {
+            let size = module.source_bytes;
             if modules.len() >= 10_000 || semantic_bytes.saturating_add(size) > 64 * 1024 * 1024 {
                 analyzer_incomplete.push(format!(
                     "JS/TS global semantic analysis limit reached before {}",

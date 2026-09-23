@@ -377,10 +377,19 @@ fn find_line(text: &str, needle: &str) -> Option<u64> {
 }
 
 pub fn build(modules: &[ModuleFacts], roots: &[Root], files: &[FileRecord]) -> GraphResult {
-    let by_path: BTreeMap<_, _> = modules
+    let by_id: BTreeMap<_, _> = modules
         .iter()
-        .map(|module| (module.path.as_str(), module))
+        .map(|module| (module.id.as_str(), module))
         .collect();
+    let mut by_path = BTreeMap::new();
+    let mut by_file: BTreeMap<&str, Vec<&ModuleFacts>> = BTreeMap::new();
+    for module in modules {
+        by_path.entry(module.path.as_str()).or_insert(module);
+        by_file
+            .entry(module.path.as_str())
+            .or_default()
+            .push(module);
+    }
     let mut edges: BTreeMap<&str, Vec<(&str, u64)>> = BTreeMap::new();
     let mut unresolved = Vec::new();
     let mut incomplete_reasons = Vec::new();
@@ -421,12 +430,19 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root], files: &[FileRecord]) -> G
                 continue;
             }
             match resolve_import(&module.path, &import.specifier, &by_path) {
-                Some(target) => {
-                    edges
-                        .entry(&module.path)
-                        .or_default()
-                        .push((target, import.line));
-                    edge_count += 1;
+                Some(target_path) => {
+                    for target in &by_file[target_path] {
+                        if edge_count + unresolved.len() >= MAX_EDGES {
+                            incomplete_reasons
+                                .push(format!("JS/TS graph edge limit of {MAX_EDGES} reached"));
+                            break;
+                        }
+                        edges
+                            .entry(&module.id)
+                            .or_default()
+                            .push((&target.id, import.line));
+                        edge_count += 1;
+                    }
                 }
                 None => unresolved.push(format!(
                     "{}:{} -> {} (relative import unresolved)",
@@ -439,7 +455,7 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root], files: &[FileRecord]) -> G
     let mut reachable: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     let mut queue = VecDeque::new();
     for root in roots {
-        if let Some((path, _)) = by_path.get_key_value(root.file.as_str()) {
+        if let Some(module) = by_id.get(root.file.as_str()) {
             let route = vec![
                 format!(
                     "trigger: {}{}",
@@ -448,10 +464,10 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root], files: &[FileRecord]) -> G
                         .map(|line| format!(" at line {line}"))
                         .unwrap_or_default()
                 ),
-                format!("entry: {path}"),
+                format!("entry: {}", module.path),
             ];
-            if reachable.insert(path, route.clone()).is_none() {
-                queue.push_back((*path, route));
+            if reachable.insert(&module.id, route.clone()).is_none() {
+                queue.push_back((module.id.as_str(), route));
             }
         } else {
             unresolved.push(if root.file.is_empty() {
@@ -463,6 +479,7 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root], files: &[FileRecord]) -> G
     }
     while let Some((source, route)) = queue.pop_front() {
         for (target, line) in edges.get(source).into_iter().flatten() {
+            let target = *target;
             if reachable.contains_key(target) {
                 continue;
             }
@@ -472,7 +489,13 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root], files: &[FileRecord]) -> G
                     .push("JS/TS execution route depth limit of 64 reached".to_owned());
                 continue;
             }
-            next.push(format!("{source}:{line} imports {target}"));
+            let source_path = by_id
+                .get(source)
+                .map_or(source, |module| module.path.as_str());
+            let target_path = by_id
+                .get(target)
+                .map_or(target, |module| module.path.as_str());
+            next.push(format!("{source_path}:{line} imports {target_path}"));
             reachable.insert(target, next.clone());
             queue.push_back((target, next));
         }
@@ -484,7 +507,7 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root], files: &[FileRecord]) -> G
         .map(|file| (file.path.as_str(), file))
         .collect();
     for module in modules {
-        let route = reachable.get(module.path.as_str());
+        let route = reachable.get(module.id.as_str());
         let disguised = !has_code_extension(&module.path);
         let mut called_functions = std::collections::BTreeSet::new();
         loop {
@@ -591,9 +614,12 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root], files: &[FileRecord]) -> G
 }
 
 fn has_code_extension(path: &str) -> bool {
-    [".js", ".cjs", ".mjs", ".jsx", ".ts", ".cts", ".mts", ".tsx"]
-        .iter()
-        .any(|extension| path.ends_with(extension))
+    [
+        ".js", ".cjs", ".mjs", ".jsx", ".ts", ".cts", ".mts", ".tsx", ".html", ".htm", ".xhtml",
+        ".vue", ".md", ".mdx",
+    ]
+    .iter()
+    .any(|extension| path.ends_with(extension))
 }
 
 fn resolve_from(from: &str, specifier: &str) -> String {

