@@ -44,6 +44,7 @@ pub enum Expr {
     Member(Box<Expr>, String),
     Call(Box<Expr>, Vec<Expr>, u64),
     Then(Box<Expr>, Binding, Vec<Stmt>),
+    Message(Box<Expr>, Binding, Vec<Stmt>),
     Object(Vec<(String, Expr)>),
     Combine(Vec<Expr>),
     Assign(String, Box<Expr>),
@@ -140,23 +141,17 @@ impl Lower<'_> {
                     && let Some(Expression::ArrowFunctionExpression(callback)) =
                         call.arguments.first().and_then(Argument::as_expression)
                 {
-                    let parameter = callback
-                        .params
-                        .items
-                        .first()
-                        .map(|item| self.binding(&item.pattern))
-                        .unwrap_or(Binding::Ignore);
-                    let body = match &callback.body {
-                        oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => {
-                            self.statements(&body.statements, &mut BTreeMap::new())
-                        }
-                        _ => callback
-                            .body
-                            .as_expression()
-                            .map(|body| vec![Stmt::Return(self.expr(body))])
-                            .unwrap_or_default(),
-                    };
+                    let (parameter, body) = self.callback(callback);
                     return Expr::Then(Box::new(self.expr(&member.object)), parameter, body);
+                }
+                if let Expression::StaticMemberExpression(member) = &call.callee
+                    && matches!(member.property.name.as_str(), "on" | "addEventListener")
+                    && call.arguments.first().and_then(argument_text) == Some("message")
+                    && let Some(Expression::ArrowFunctionExpression(callback)) =
+                        call.arguments.get(1).and_then(Argument::as_expression)
+                {
+                    let (parameter, body) = self.callback(callback);
+                    return Expr::Message(Box::new(self.expr(&member.object)), parameter, body);
                 }
                 Expr::Call(
                     Box::new(self.expr(&call.callee)),
@@ -197,6 +192,18 @@ impl Lower<'_> {
                     })
                     .collect(),
             ),
+            Expression::ArrayExpression(array) => Expr::Combine(
+                array
+                    .elements
+                    .iter()
+                    .map(|element| {
+                        element
+                            .as_expression()
+                            .map(|item| self.expr(item))
+                            .unwrap_or(Expr::Unknown)
+                    })
+                    .collect(),
+            ),
             Expression::BinaryExpression(binary) => {
                 Expr::Combine(vec![self.expr(&binary.left), self.expr(&binary.right)])
             }
@@ -231,6 +238,26 @@ impl Lower<'_> {
             Some(expression) => self.expr(expression),
             None => Expr::Unknown,
         }
+    }
+
+    fn callback(&self, arrow: &oxc_ast::ast::ArrowFunctionExpression<'_>) -> (Binding, Vec<Stmt>) {
+        let parameter = arrow
+            .params
+            .items
+            .first()
+            .map(|item| self.binding(&item.pattern))
+            .unwrap_or(Binding::Ignore);
+        let body = match &arrow.body {
+            oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => {
+                self.statements(&body.statements, &mut BTreeMap::new())
+            }
+            _ => arrow
+                .body
+                .as_expression()
+                .map(|body| vec![Stmt::Return(self.expr(body))])
+                .unwrap_or_default(),
+        };
+        (parameter, body)
     }
 
     fn statements(
@@ -375,6 +402,13 @@ impl Lower<'_> {
             }
             _ => Vec::new(),
         }
+    }
+}
+
+fn argument_text<'a>(argument: &'a Argument<'_>) -> Option<&'a str> {
+    match argument {
+        Argument::StringLiteral(value) => Some(value.value.as_str()),
+        _ => None,
     }
 }
 
@@ -834,6 +868,17 @@ impl Evaluator<'_> {
                 self.run(path, body, &mut scope, depth + 1)
                     .unwrap_or_default()
             }
+            Expr::Message(receiver, parameter, body) => {
+                let value = self.eval(path, receiver, environment, depth);
+                if value.name.as_deref() != Some("WebSocket") && value.name.as_deref() != Some("ws")
+                {
+                    return Value::default();
+                }
+                let mut scope = environment.clone();
+                self.bind(parameter, value, &mut scope);
+                self.run(path, body, &mut scope, depth + 1)
+                    .unwrap_or_default()
+            }
             Expr::Unknown => Value::default(),
         }
     }
@@ -897,34 +942,35 @@ impl Evaluator<'_> {
             normalized,
             "axios"
                 | "axios.get"
+                | "axios.post"
+                | "axios.request"
                 | "fetch"
+                | "globalThis.fetch"
+                | "window.fetch"
                 | "got"
                 | "request"
+                | "undici.fetch"
                 | "undici.request"
+                | "http.get"
+                | "https.get"
                 | "http.request"
                 | "https.request"
                 | "WebSocket"
                 | "ws"
                 | "net.Socket"
+                | "net.connect"
                 | "tls.connect"
         ) {
-            if matches!(
-                normalized,
-                "fetch"
-                    | "axios"
-                    | "axios.post"
-                    | "http.request"
-                    | "https.request"
-                    | "request"
-                    | "undici.request"
-            ) {
-                self.exfiltration(path, line, name, &args);
-            }
-            return Value::labeled(Label::Remote, source);
-        }
-        if normalized == "axios.post" {
             self.exfiltration(path, line, name, &args);
-            return Value::labeled(Label::Remote, source);
+            let mut value = Value::labeled(Label::Remote, source);
+            if matches!(normalized, "WebSocket" | "ws") {
+                value.name = Some(normalized.to_owned());
+            }
+            return value;
+        }
+        if matches!(normalized, "WebSocket.send" | "ws.send") {
+            self.exfiltration(path, line, name, &args);
+            return Value::default();
         }
         if matches!(
             normalized,
@@ -1027,6 +1073,16 @@ impl Evaluator<'_> {
                         .propagate(format!("write: {path}:{line} {name}")),
                 );
             }
+        }
+        if matches!(
+            normalized,
+            "fs.chmod" | "fs.chmodSync" | "fs.promises.chmod" | "fs/promises.chmod"
+        ) && let Some(target) = args.first().and_then(|value| value.literal.as_deref())
+            && let Some(written) = self.written.get_mut(target)
+        {
+            *written = written
+                .clone()
+                .propagate(format!("chmod: {path}:{line} {name}"));
         }
         if matches!(
             normalized,

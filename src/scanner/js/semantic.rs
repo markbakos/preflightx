@@ -347,7 +347,7 @@ impl<'a> Visit<'a> for Collector<'_> {
     fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'a>) {
         if let Some(name) = self.name(&member.object) {
             let name = format!("{name}.{}", member.property.name);
-            if capability(&name) == Some(Capability::Secret) || name == "process.env" {
+            if capability(&name) == Some(Capability::Secret) {
                 self.push_call(name, member.span);
             }
         }
@@ -355,6 +355,14 @@ impl<'a> Visit<'a> for Collector<'_> {
     }
 
     fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
+        if let (Some(object), Some(property)) =
+            (self.name(&member.object), static_string(&member.expression))
+        {
+            let name = format!("{object}.{property}");
+            if capability(&name) == Some(Capability::Secret) {
+                self.push_call(name, member.span);
+            }
+        }
         walk::walk_computed_member_expression(self, member);
     }
 }
@@ -412,9 +420,11 @@ fn capability(name: &str) -> Option<Capability> {
         | "node:child_process.fork"
         | "Bun.spawn"
         | "Deno.Command" => Some(Capability::Process),
-        "fetch" | "axios" | "axios.get" | "axios.post" | "http.request" | "https.request"
-        | "node:http.request" | "node:https.request" | "got" | "request" | "undici.request"
-        | "WebSocket" | "ws" | "net.Socket" | "tls.connect" => Some(Capability::Network),
+        "fetch" | "globalThis.fetch" | "window.fetch" | "axios" | "axios.get" | "axios.post"
+        | "axios.request" | "http.get" | "https.get" | "http.request" | "https.request"
+        | "node:http.get" | "node:https.get" | "node:http.request" | "node:https.request"
+        | "got" | "request" | "undici.fetch" | "undici.request" | "WebSocket" | "ws"
+        | "net.Socket" | "net.connect" | "tls.connect" => Some(Capability::Network),
         "fs.readFile"
         | "fs.readFileSync"
         | "fs.promises.readFile"
@@ -422,7 +432,7 @@ fn capability(name: &str) -> Option<Capability> {
         | "node:fs.readFile"
         | "node:fs.readFileSync"
         | "node:fs/promises.readFile" => Some(Capability::FileRead),
-        "process.env" | "os.homedir" | "node:os.homedir" => Some(Capability::Secret),
+        "os.homedir" | "node:os.homedir" => Some(Capability::Secret),
         "fs.writeFile"
         | "fs.writeFileSync"
         | "fs.promises.writeFile"
@@ -437,6 +447,14 @@ fn capability(name: &str) -> Option<Capability> {
         | "node:fs.chmod"
         | "node:fs.chmodSync"
         | "node:fs/promises.chmod" => Some(Capability::Chmod),
+        _ if name.starts_with("process.env.")
+            && !matches!(
+                name.strip_prefix("process.env."),
+                Some("NODE_ENV" | "CI" | "DEBUG" | "TERM")
+            ) =>
+        {
+            Some(Capability::Secret)
+        }
         _ => None,
     }
 }
