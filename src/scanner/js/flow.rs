@@ -50,7 +50,7 @@ pub enum Expr {
     Call(Box<Expr>, Vec<Expr>, u64),
     Construct(Box<Expr>, Vec<Expr>, u64),
     Then(Box<Expr>, Binding, Vec<Stmt>),
-    Message(Box<Expr>, Binding, Vec<Stmt>),
+    Message(Box<Expr>, Binding, Vec<Stmt>, String),
     Object(Vec<(String, Expr)>),
     Combine(Vec<Expr>),
     Assign(String, Box<Expr>),
@@ -156,7 +156,7 @@ impl Lower<'_> {
                     && matches!(member.property.name.as_str(), "on" | "addEventListener")
                     && matches!(
                         call.arguments.first().and_then(argument_text),
-                        Some("message" | "data" | "response")
+                        Some("message" | "data" | "end" | "response")
                     )
                     && let Some((parameter, body)) = call
                         .arguments
@@ -164,7 +164,16 @@ impl Lower<'_> {
                         .and_then(Argument::as_expression)
                         .and_then(|callback| self.callback_expression(callback))
                 {
-                    return Expr::Message(Box::new(self.expr(&member.object)), parameter, body);
+                    return Expr::Message(
+                        Box::new(self.expr(&member.object)),
+                        parameter,
+                        body,
+                        call.arguments
+                            .first()
+                            .and_then(argument_text)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    );
                 }
                 if let Expression::StaticMemberExpression(member) = &call.callee
                     && matches!(member.property.name.as_str(), "get" | "request")
@@ -990,6 +999,7 @@ struct Evaluator<'a> {
     steps: usize,
     limited: bool,
     written: BTreeMap<String, Value>,
+    stream_data: BTreeMap<(String, String), BTreeMap<String, Value>>,
 }
 
 const MAX_FLOW_STEPS: usize = 100_000;
@@ -1015,6 +1025,7 @@ pub fn analyze_flows(
         steps: 0,
         limited: false,
         written: BTreeMap::new(),
+        stream_data: BTreeMap::new(),
     };
     for module in modules {
         if evaluator.limited {
@@ -1305,6 +1316,17 @@ impl Evaluator<'_> {
                 if matches!(callee.as_ref(), Expr::Member(_, _)) && !function.labels.is_empty() {
                     args.insert(0, function.clone());
                 }
+                if let Expr::Member(object, method) = callee.as_ref()
+                    && matches!(method.as_str(), "push" | "unshift")
+                    && let Expr::Name(name) = object.as_ref()
+                {
+                    let mut array = environment.get(name).cloned().unwrap_or_default();
+                    for argument in args {
+                        array.merge(argument);
+                    }
+                    environment.insert(name.clone(), array);
+                    return Value::default();
+                }
                 self.invoke(
                     path,
                     function.name.as_deref().unwrap_or(""),
@@ -1335,7 +1357,7 @@ impl Evaluator<'_> {
                 self.run(path, body, &mut scope, depth + 1)
                     .unwrap_or_default()
             }
-            Expr::Message(receiver, parameter, body) => {
+            Expr::Message(receiver, parameter, body, event) => {
                 let value = self.eval(path, receiver, environment, depth);
                 if !matches!(
                     value.name.as_deref(),
@@ -1351,10 +1373,39 @@ impl Evaluator<'_> {
                 ) {
                     return Value::default();
                 }
+                let stream = matches!(
+                    value.name.as_deref(),
+                    Some("http.response" | "network.socket")
+                );
+                let stream_key = (
+                    path.to_owned(),
+                    match receiver.as_ref() {
+                        Expr::Name(name) => name.clone(),
+                        _ => value.name.clone().unwrap_or_default(),
+                    },
+                );
+                let stream_data = stream && event == "data";
+                let stream_end = stream && event == "end";
                 let mut scope = environment.clone();
+                if stream_end && let Some(previous_chunks) = self.stream_data.get(&stream_key) {
+                    for (name, value) in previous_chunks {
+                        if let Some(existing) = scope.get_mut(name) {
+                            existing.merge(value.clone());
+                        }
+                    }
+                }
                 self.bind(parameter, value, &mut scope);
-                self.run(path, body, &mut scope, depth + 1)
-                    .unwrap_or_default()
+                let result = self.run(path, body, &mut scope, depth + 1);
+                if stream_data {
+                    // Stream data callbacks run before `end`; other async callback effects stay scoped.
+                    let chunks = self.stream_data.entry(stream_key).or_default();
+                    for (name, value) in scope {
+                        if environment.contains_key(&name) {
+                            chunks.entry(name).or_default().merge(value);
+                        }
+                    }
+                }
+                result.unwrap_or_default()
             }
             Expr::Unknown => Value::default(),
         }
@@ -1607,6 +1658,7 @@ impl Evaluator<'_> {
             || normalized.ends_with(".text")
             || normalized.ends_with(".buffer")
             || normalized.ends_with(".arrayBuffer")
+            || normalized == "Buffer.concat"
             || normalized.ends_with(".concat")
             || normalized.ends_with(".replace")
             || normalized.ends_with(".slice")

