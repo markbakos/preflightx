@@ -2,7 +2,7 @@ use crate::model::{Confidence, Finding, Severity};
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use std::{ops::Range, path::Path};
+use std::{collections::HashMap, ops::Range, path::Path};
 
 mod flow;
 mod semantic;
@@ -13,6 +13,7 @@ const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_NESTING: usize = 256;
 const MAX_EMBEDDED_SCRIPTS: usize = 256;
 const MAX_MARKDOWN_FENCES: usize = 4_096;
+const MAX_MARKDOWN_CODE_SPANS: usize = 32_768;
 
 #[derive(Clone, Debug)]
 pub struct EmbeddedRoot {
@@ -322,8 +323,13 @@ fn extract_scripts(text: &str, markdown: bool) -> Extraction<'_> {
         blocks: Vec::new(),
         incomplete: Vec::new(),
     };
-    let fences = if markdown {
-        markdown_fences(text, &mut extraction.incomplete)
+    let excluded = if markdown {
+        let fences = markdown_fences(text, &mut extraction.incomplete);
+        let spans = markdown_code_spans(text, &fences, &mut extraction.incomplete);
+        let mut ranges = fences;
+        ranges.extend(spans);
+        ranges.sort_unstable_by_key(|range| range.start);
+        ranges
     } else {
         Vec::new()
     };
@@ -332,13 +338,13 @@ fn extract_scripts(text: &str, markdown: bool) -> Extraction<'_> {
     let mut fence_index = 0;
     while let Some(open) = find_ascii_case_insensitive(text.as_bytes(), b"<script", cursor) {
         cursor = open + b"<script".len();
-        while fences
+        while excluded
             .get(fence_index)
             .is_some_and(|range| open >= range.end)
         {
             fence_index += 1;
         }
-        if fences
+        if excluded
             .get(fence_index)
             .is_some_and(|range| range.contains(&open))
         {
@@ -603,6 +609,79 @@ fn markdown_fences(text: &str, incomplete: &mut Vec<String>) -> Vec<Range<usize>
     ranges
 }
 
+fn markdown_code_spans(
+    text: &str,
+    fences: &[Range<usize>],
+    incomplete: &mut Vec<String>,
+) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    let mut openings = HashMap::new();
+    let mut fence_index = 0;
+    let mut cursor = 0;
+    let bytes = text.as_bytes();
+    while cursor < bytes.len() {
+        while fences
+            .get(fence_index)
+            .is_some_and(|range| cursor >= range.end)
+        {
+            fence_index += 1;
+        }
+        if let Some(fence) = fences
+            .get(fence_index)
+            .filter(|range| range.contains(&cursor))
+        {
+            cursor = fence.end;
+            openings.clear();
+            continue;
+        }
+        if matches!(bytes[cursor], b'\r' | b'\n') {
+            let next_line = cursor
+                + usize::from(bytes[cursor] == b'\r' && bytes.get(cursor + 1) == Some(&b'\n'))
+                + 1;
+            let mut next_content = next_line;
+            while matches!(bytes.get(next_content), Some(b' ' | b'\t')) {
+                next_content += 1;
+            }
+            if matches!(bytes.get(next_content), Some(b'\r' | b'\n')) {
+                openings.clear();
+            }
+            cursor = next_line;
+            continue;
+        }
+        if bytes[cursor] != b'`' {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        while bytes.get(cursor) == Some(&b'`') {
+            cursor += 1;
+        }
+        let mut escapes = 0;
+        let mut previous = start;
+        while previous > 0 && bytes[previous - 1] == b'\\' {
+            escapes += 1;
+            previous -= 1;
+        }
+        if escapes % 2 == 1 {
+            continue;
+        }
+        let length = cursor - start;
+        if let Some(open) = openings.remove(&length) {
+            if spans.len() == MAX_MARKDOWN_CODE_SPANS {
+                incomplete.push(format!(
+                    "Markdown code span limit of {MAX_MARKDOWN_CODE_SPANS} reached"
+                ));
+                spans.push(open..text.len());
+                break;
+            }
+            spans.push(open..cursor);
+        } else {
+            openings.insert(length, start);
+        }
+    }
+    spans
+}
+
 fn push_fence_range(
     ranges: &mut Vec<Range<usize>>,
     incomplete: &mut Vec<String>,
@@ -624,7 +703,10 @@ fn push_fence_range(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_EMBEDDED_SCRIPTS, MAX_MARKDOWN_FENCES, MAX_NESTING, MAX_PARSE_BYTES, analyze};
+    use super::{
+        MAX_EMBEDDED_SCRIPTS, MAX_MARKDOWN_CODE_SPANS, MAX_MARKDOWN_FENCES, MAX_NESTING,
+        MAX_PARSE_BYTES, analyze,
+    };
 
     #[test]
     fn parses_supported_javascript_and_typescript() {
@@ -731,6 +813,21 @@ mod tests {
         assert!(!markdown.modules[0].flow_enabled);
         assert!(markdown.embedded_roots.is_empty());
 
+        let markdown_code = analyze(
+            "README.md",
+            Some(
+                "Use `<script type=\"module\">` and `` `<script>` `` in docs.\n```html\n<script>eval('example only')</script>\n```\n<script type=\"module\">eval('source')</script>",
+            ),
+        );
+        assert!(markdown_code.incomplete_reasons.is_empty());
+        assert_eq!(markdown_code.modules.len(), 1);
+        assert!(
+            markdown_code.modules[0]
+                .calls
+                .iter()
+                .any(|call| call.name == "eval")
+        );
+
         let data_script = analyze(
             "index.html",
             Some("<script type=\"application/ld+json\">{\"ok\":true}</script>"),
@@ -765,6 +862,15 @@ mod tests {
                 .incomplete_reasons
                 .iter()
                 .any(|reason| reason.contains("Markdown fence limit"))
+        );
+
+        let many_code_spans = "`x` ".repeat(MAX_MARKDOWN_CODE_SPANS + 1);
+        let capped_code_spans = analyze("many.md", Some(&many_code_spans));
+        assert!(
+            capped_code_spans
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason.contains("Markdown code span limit"))
         );
     }
 
