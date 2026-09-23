@@ -1373,6 +1373,25 @@ impl Evaluator<'_> {
                 if matches!(callee.as_ref(), Expr::Member(_, _)) && !function.labels.is_empty() {
                     args.insert(0, function.clone());
                 }
+                if function.name.as_deref() == Some("Object.assign")
+                    && let Some(Expr::Name(target_name)) = arguments.first()
+                {
+                    let mut target = environment
+                        .get(target_name)
+                        .cloned()
+                        .or_else(|| args.first().cloned())
+                        .unwrap_or_default();
+                    for source in args.iter().skip(1) {
+                        target.merge(source.clone());
+                    }
+                    target.literal = None;
+                    target.path_hint = None;
+                    target.path_key = None;
+                    target =
+                        target.propagate(format!("transform: {file_path}:{line} Object.assign"));
+                    environment.insert(target_name.clone(), target.clone());
+                    return target;
+                }
                 if let Expr::Member(object, method) = callee.as_ref()
                     && matches!(method.as_str(), "push" | "unshift")
                     && let Expr::Name(name) = object.as_ref()

