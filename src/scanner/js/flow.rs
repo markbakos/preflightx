@@ -1541,6 +1541,20 @@ impl Evaluator<'_> {
         let normalized = name.strip_prefix("node:").unwrap_or(name);
         let file_path = self.file_path(path).to_owned();
         let source = format!("source: {file_path}:{line} {name}");
+        if normalized == "Object.assign" {
+            let mut value = Value::default();
+            for argument in args {
+                value.merge(argument);
+            }
+            return value.propagate(format!("transform: {file_path}:{line} {name}"));
+        }
+        if normalized == "Object.fromEntries" {
+            return args
+                .first()
+                .cloned()
+                .unwrap_or_default()
+                .propagate(format!("transform: {file_path}:{line} {name}"));
+        }
         if normalized == "Object.keys" {
             return Value::default();
         }
