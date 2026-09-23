@@ -79,15 +79,19 @@ impl Lower<'_> {
     fn binding(&self, pattern: &BindingPattern<'_>) -> Binding {
         match pattern {
             BindingPattern::BindingIdentifier(name) => Binding::Name(name.name.to_string()),
-            BindingPattern::ObjectPattern(object) => Binding::Object(
-                object
+            BindingPattern::ObjectPattern(object) => {
+                let mut properties = object
                     .properties
                     .iter()
                     .filter_map(|property| {
                         Some((self.key(&property.key)?, self.binding(&property.value)))
                     })
-                    .collect(),
-            ),
+                    .collect::<Vec<_>>();
+                if let Some(rest) = &object.rest {
+                    properties.push(("*".to_owned(), self.binding(&rest.argument)));
+                }
+                Binding::Object(properties)
+            }
             BindingPattern::ArrayPattern(array) => Binding::Array(
                 array
                     .elements
@@ -762,6 +766,10 @@ fn argument_text<'a>(argument: &'a Argument<'_>) -> Option<&'a str> {
     }
 }
 
+fn non_secret_environment_key(key: &str) -> bool {
+    matches!(key, "NODE_ENV" | "CI" | "DEBUG" | "TERM")
+}
+
 pub fn lower(program: &Program<'_>, source: &str, line_offset: u64) -> ModuleFlow {
     let lower = Lower {
         source,
@@ -1244,12 +1252,20 @@ impl Evaluator<'_> {
             }
             Binding::Object(properties) => {
                 for (property, nested) in properties {
-                    let selected = value.fields.get(property).cloned().unwrap_or_else(|| {
-                        let mut selected = value.clone();
-                        selected.name =
-                            value.name.as_ref().map(|name| format!("{name}.{property}"));
-                        selected
-                    });
+                    let selected = if property == "*" {
+                        value.clone()
+                    } else if value.name.as_deref() == Some("process.env")
+                        && non_secret_environment_key(property)
+                    {
+                        Value::named(format!("process.env.{property}"))
+                    } else {
+                        value.fields.get(property).cloned().unwrap_or_else(|| {
+                            let mut selected = value.clone();
+                            selected.name =
+                                value.name.as_ref().map(|name| format!("{name}.{property}"));
+                            selected
+                        })
+                    };
                     self.bind(nested, selected, environment);
                 }
             }
@@ -1307,7 +1323,7 @@ impl Evaluator<'_> {
                     return value;
                 }
                 if base.name.as_deref() == Some("process.env")
-                    && matches!(property.as_str(), "NODE_ENV" | "CI" | "DEBUG" | "TERM")
+                    && non_secret_environment_key(property)
                 {
                     return Value::named(format!("process.env.{property}"));
                 }
