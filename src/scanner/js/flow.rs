@@ -953,6 +953,7 @@ struct Value {
     name: Option<String>,
     literal: Option<String>,
     path_hint: Option<String>,
+    stream_reader: bool,
     labels: BTreeMap<Label, Vec<String>>,
     fields: BTreeMap<String, Value>,
 }
@@ -989,6 +990,7 @@ impl Value {
         if self.path_hint.is_none() {
             self.path_hint = other.path_hint;
         }
+        self.stream_reader |= other.stream_reader;
         if self.name.is_none() {
             self.name = other.name;
         }
@@ -1667,6 +1669,30 @@ impl Evaluator<'_> {
                 }
             }
             return value;
+        }
+        if normalized.ends_with(".getReader")
+            && let Some(stream) = args.iter().find(|value| {
+                value
+                    .label(&[Label::Remote, Label::DecodedRemote])
+                    .is_some()
+            })
+        {
+            let mut reader = stream.clone();
+            reader.stream_reader = true;
+            return reader.propagate(format!("stream reader: {file_path}:{line} {name}"));
+        }
+        if normalized.ends_with(".read")
+            && let Some(reader) = args.first()
+            && reader.stream_reader
+        {
+            let mut result = Value::default();
+            result.fields.insert(
+                "value".to_owned(),
+                reader
+                    .clone()
+                    .propagate(format!("stream chunk: {file_path}:{line} {name}")),
+            );
+            return result;
         }
         if matches!(
             normalized,
