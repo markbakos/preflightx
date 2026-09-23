@@ -2,10 +2,10 @@ use super::{ModuleFacts, semantic::capability, semantic::static_string};
 use crate::model::{Confidence, Finding, Severity};
 use crate::scanner::graph::resolve_import;
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, BindingPattern, Declaration, ExportDefaultDeclarationKind,
-    Expression, ForStatementInit, ForStatementLeft, ImportDeclarationSpecifier,
-    MethodDefinitionKind, MethodDefinitionType, ModuleExportName, ObjectPropertyKind, Program,
-    PropertyKey, Statement, VariableDeclaration,
+    Argument, AssignmentOperator, AssignmentTarget, BindingPattern, Declaration,
+    ExportDefaultDeclarationKind, Expression, ForStatementInit, ForStatementLeft,
+    ImportDeclarationSpecifier, MethodDefinitionKind, MethodDefinitionType, ModuleExportName,
+    ObjectPropertyKind, Program, PropertyKey, Statement, VariableDeclaration,
 };
 use std::collections::BTreeMap;
 
@@ -75,6 +75,7 @@ pub enum Expr {
     Object(Vec<(String, Expr)>),
     Array(Vec<Expr>),
     Combine(Vec<Expr>),
+    Sequence(Vec<Expr>),
     Assign(String, Box<Expr>),
     Unknown,
 }
@@ -320,7 +321,7 @@ impl Lower<'_> {
                 self.expr(&conditional.consequent),
                 self.expr(&conditional.alternate),
             ]),
-            Expression::SequenceExpression(sequence) => Expr::Combine(
+            Expression::SequenceExpression(sequence) => Expr::Sequence(
                 sequence
                     .expressions
                     .iter()
@@ -330,7 +331,13 @@ impl Lower<'_> {
             Expression::AssignmentExpression(assignment) => {
                 match assignment.left.get_identifier_name() {
                     Some(name) => {
-                        Expr::Assign(name.to_owned(), Box::new(self.expr(&assignment.right)))
+                        let right = self.expr(&assignment.right);
+                        let value = if assignment.operator == AssignmentOperator::Assign {
+                            right
+                        } else {
+                            Expr::Combine(vec![Expr::Name(name.to_owned()), right])
+                        };
+                        Expr::Assign(name.to_owned(), Box::new(value))
                     }
                     None => self.expr(&assignment.right),
                 }
@@ -1412,6 +1419,13 @@ impl Evaluator<'_> {
                     combined.path_hint = Some(path_hint);
                 }
                 combined
+            }
+            Expr::Sequence(parts) => {
+                let mut value = Value::default();
+                for part in parts {
+                    value = self.eval(path, part, environment, depth);
+                }
+                value
             }
             Expr::Assign(name, right) => {
                 let value = self.eval(path, right, environment, depth);

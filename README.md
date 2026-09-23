@@ -2,7 +2,7 @@
 
 A local-first, static security scanner for inspecting untrusted source repositories before executing them.
 
-> Development status: the safe scanning foundation, bounded JS/TS parsing, local execution reachability, and initial cross-file source-to-sink tracing are implemented. Stage 2 remains in progress; threat intelligence is not implemented.
+> Development status: the safe scanning foundation and focused Stage 2 JS/TS behavior tracing are implemented locally. Stage 2 acceptance is still in progress; threat intelligence and archive analysis are later stages.
 
 PreflightX is designed to remain offline by default, treat every target file as hostile, never execute target code, and never modify the repository being inspected.
 
@@ -16,7 +16,11 @@ preflightx rules
 preflightx explain JS-REMOTE-CODE-EXECUTION
 ```
 
-The current scanner inventories files without following symlinks, enforces resource limits, classifies bytes independently of extensions, identifies raw concealment signals, inspects npm and developer-tool metadata, and parses JS/TS or source-led suspicious text with Oxc. It traces relative imports from recognized npm, VS Code, devcontainer, CI, and build-config roots; elevates reachable disguised JavaScript; and follows supported network and secret values through function expressions, CommonJS/ESM imports and re-exports, promise/HTTP/socket callbacks, decoding, file streams, and execution sinks. It also correlates matching exfiltration and remote-execution routes, reports selected startup writes/commands, and exposes implemented rule descriptions. Dynamic module targets, unresolved imports, parser failures, and reached analysis limits are reported. Embedded HTML/Vue/Markdown scripts are not extracted; these analyses cover evidenced patterns, not arbitrary JavaScript behavior.
+The current scanner inventories files, inspects symlinks without following them, enforces resource limits, classifies bytes independently of extensions, identifies concealment and anti-analysis clues, inspects npm and developer-tool metadata, and parses supported JS/TS with Oxc. It follows imports from recognized npm, VS Code folder-open, devcontainer, CI, and build-config roots, including bounded scripts embedded in HTML, Vue, Markdown raw HTML, and SVG; Markdown code examples are not treated as executable source.
+
+For supported patterns, Stage 2 traces remote responses into `eval`, `Function`, VM APIs, dynamic imports, and process execution; tracks environment, credential-file, clipboard, and home-directory data into outbound requests; and links remote downloads to file writes and later execution. It follows common aliases, wrappers, ESM/CommonJS exports, callbacks, decoders, object/argument spread, and selected control-flow forms across files. Findings explain the observed source, flow, sink, and trigger where available.
+
+This is a bounded malware-focused model, not a complete JavaScript interpreter and not a verdict that a repository is safe. Dynamic module targets, unresolved imports, parser failures, and reached analysis limits are reported; parser or resource limits make a scan incomplete (exit code 2). Default scans remain offline and never execute or modify target code.
 
 ## Development
 

