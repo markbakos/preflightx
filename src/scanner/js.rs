@@ -25,7 +25,15 @@ pub fn analyze(path: &str, text: Option<&str>) -> JsAnalysis {
         extension,
         Some("js" | "cjs" | "mjs" | "jsx" | "ts" | "cts" | "mts" | "tsx")
     );
-    let suspicious = text.is_some_and(super::classifier::looks_like_executable_text);
+    let suspicious = text.is_some_and(|text| {
+        super::classifier::looks_like_executable_text(text)
+            || (matches!(
+                extension,
+                Some("svg" | "woff" | "woff2" | "png" | "jpg" | "gif")
+            ) && ["eval(", "require(", "module.exports", "const ", "function "]
+                .iter()
+                .any(|prefix| text.trim_start().starts_with(prefix)))
+    });
     let mut result = JsAnalysis {
         language: None,
         findings: Vec::new(),
@@ -71,12 +79,10 @@ pub fn analyze(path: &str, text: Option<&str>) -> JsAnalysis {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, text, source_type).parse();
     if parsed.fatal_error || !parsed.diagnostics.is_empty() {
-        if supported {
-            result.incomplete_reasons.push(format!(
-                "JS/TS parser could not fully parse {path}: {} diagnostic(s)",
-                parsed.diagnostics.len()
-            ));
-        }
+        result.incomplete_reasons.push(format!(
+            "JS/TS parser could not fully parse {path}: {} diagnostic(s)",
+            parsed.diagnostics.len()
+        ));
         return result;
     }
     if !supported && parsed.program.body.is_empty() {
@@ -136,6 +142,8 @@ mod tests {
         assert_eq!(positive.findings[0].id, "FILE-PARSEABLE-JAVASCRIPT");
         let evasion = analyze("fake.svg", Some("   const cp = require('child_process');"));
         assert_eq!(evasion.language.as_deref(), Some("javascript"));
+        let minimal = analyze("fake.svg", Some("eval('2 + 2');"));
+        assert_eq!(minimal.language.as_deref(), Some("javascript"));
         let negative = analyze("real.svg", Some("<svg><text>const x = 1</text></svg>"));
         assert!(negative.findings.is_empty());
     }
@@ -144,6 +152,8 @@ mod tests {
     fn syntax_and_size_failures_are_incomplete() {
         let malformed = analyze("broken.js", Some("const = ;"));
         assert_eq!(malformed.incomplete_reasons.len(), 1);
+        let disguised_malformed = analyze("broken.svg", Some("const = ; require('x');"));
+        assert_eq!(disguised_malformed.incomplete_reasons.len(), 1);
         let oversized = analyze("large.js", Some(&" ".repeat(MAX_PARSE_BYTES + 1)));
         assert_eq!(oversized.incomplete_reasons.len(), 1);
         let nested = analyze("nested.js", Some(&"(".repeat(MAX_NESTING + 1)));

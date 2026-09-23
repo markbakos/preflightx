@@ -146,12 +146,31 @@ impl Lower<'_> {
                 }
                 if let Expression::StaticMemberExpression(member) = &call.callee
                     && matches!(member.property.name.as_str(), "on" | "addEventListener")
-                    && call.arguments.first().and_then(argument_text) == Some("message")
+                    && matches!(
+                        call.arguments.first().and_then(argument_text),
+                        Some("message" | "data")
+                    )
                     && let Some(Expression::ArrowFunctionExpression(callback)) =
                         call.arguments.get(1).and_then(Argument::as_expression)
                 {
                     let (parameter, body) = self.callback(callback);
                     return Expr::Message(Box::new(self.expr(&member.object)), parameter, body);
+                }
+                if let Expression::StaticMemberExpression(member) = &call.callee
+                    && matches!(member.property.name.as_str(), "get" | "request")
+                    && let Some(Expression::ArrowFunctionExpression(callback)) =
+                        call.arguments.last().and_then(Argument::as_expression)
+                {
+                    let (parameter, body) = self.callback(callback);
+                    let request = Expr::Call(
+                        Box::new(self.expr(&call.callee)),
+                        call.arguments
+                            .iter()
+                            .map(|argument| self.argument(argument))
+                            .collect(),
+                        self.line(call.span.start),
+                    );
+                    return Expr::Then(Box::new(request), parameter, body);
                 }
                 Expr::Call(
                     Box::new(self.expr(&call.callee)),
@@ -483,26 +502,30 @@ enum ChainRule {
 }
 
 impl ChainRule {
-    fn details(self) -> (&'static str, &'static str, u8) {
+    fn details(self) -> (&'static str, &'static str, &'static str, u8) {
         match self {
             Self::RemoteCode => (
                 "JS-REMOTE-CODE-EXECUTION",
                 "Remote data reaches dynamic execution",
+                "Remote input can become JavaScript executed by this program.",
                 98,
             ),
             Self::RemoteProcess => (
                 "JS-REMOTE-PROCESS-EXECUTION",
                 "Remote data reaches process execution",
+                "Remote input can influence a process or shell command.",
                 97,
             ),
             Self::DownloadExecute => (
                 "JS-DOWNLOAD-WRITE-EXECUTE",
                 "Downloaded bytes are written and executed",
+                "Remote content can be saved and launched as a local program.",
                 98,
             ),
             Self::SecretExfiltration => (
                 "JS-SECRET-EXFILTRATION",
                 "Sensitive data reaches an outbound request",
+                "Sensitive local data can leave through a network request.",
                 97,
             ),
         }
@@ -870,7 +893,9 @@ impl Evaluator<'_> {
             }
             Expr::Message(receiver, parameter, body) => {
                 let value = self.eval(path, receiver, environment, depth);
-                if value.name.as_deref() != Some("WebSocket") && value.name.as_deref() != Some("ws")
+                if value.name.as_deref() != Some("WebSocket")
+                    && value.name.as_deref() != Some("ws")
+                    && value.name.as_deref() != Some("http.response")
                 {
                     return Value::default();
                 }
@@ -965,6 +990,11 @@ impl Evaluator<'_> {
             let mut value = Value::labeled(Label::Remote, source);
             if matches!(normalized, "WebSocket" | "ws") {
                 value.name = Some(normalized.to_owned());
+            } else if matches!(
+                normalized,
+                "http.get" | "https.get" | "http.request" | "https.request"
+            ) {
+                value.name = Some("http.response".to_owned());
             }
             return value;
         }
@@ -1198,7 +1228,7 @@ impl Evaluator<'_> {
     }
 
     fn emit(&mut self, rule: ChainRule, path: &str, line: u64, sink: &str, route: &[String]) {
-        let (id, title, score) = rule.details();
+        let (id, title, impact, score) = rule.details();
         if !self.seen.insert((id.to_owned(), path.to_owned(), line)) {
             return;
         }
@@ -1210,11 +1240,19 @@ impl Evaluator<'_> {
         evidence.extend(route.iter().cloned());
         evidence.push(format!("sink: {path}:{line} {sink}"));
         self.findings.push(Finding {
-            id: id.to_owned(), severity: Severity::Critical,
-            confidence: if self.reachable.contains_key(path) { Confidence::VeryHigh } else { Confidence::High },
-            score, title: title.to_owned(),
-            message: "A source-to-sink path connects attacker-controlled or sensitive data to a high-impact capability.".to_owned(),
-            file: Some(path.to_owned()), line: Some(line), evidence,
+            id: id.to_owned(),
+            severity: Severity::Critical,
+            confidence: if self.reachable.contains_key(path) {
+                Confidence::VeryHigh
+            } else {
+                Confidence::High
+            },
+            score,
+            title: title.to_owned(),
+            message: impact.to_owned(),
+            file: Some(path.to_owned()),
+            line: Some(line),
+            evidence,
         });
     }
 }
