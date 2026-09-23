@@ -2081,6 +2081,20 @@ impl Evaluator<'_> {
                 .clone()
                 .propagate(format!("chmod: {file_path}:{line} {name}"));
         }
+        let loaded_path = match normalized {
+            "require" | "import" => args.first(),
+            "process.dlopen" => args.get(1),
+            _ => None,
+        };
+        if let Some(target) = loaded_path.and_then(Value::file_target)
+            && let Some(route) = self
+                .written
+                .get(&target)
+                .and_then(|written| written.label(&[Label::DecodedRemote, Label::Remote]))
+                .cloned()
+        {
+            self.emit(ChainRule::DownloadExecute, path, line, name, &route);
+        }
         if matches!(
             normalized,
             "eval"

