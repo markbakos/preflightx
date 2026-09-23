@@ -954,6 +954,7 @@ struct Value {
     name: Option<String>,
     literal: Option<String>,
     path_hint: Option<String>,
+    path_key: Option<String>,
     stream_reader: bool,
     labels: BTreeMap<Label, Vec<String>>,
     fields: BTreeMap<String, Value>,
@@ -991,6 +992,9 @@ impl Value {
         if self.path_hint.is_none() {
             self.path_hint = other.path_hint;
         }
+        if self.path_key.is_none() {
+            self.path_key = other.path_key;
+        }
         self.stream_reader |= other.stream_reader;
         if self.name.is_none() {
             self.name = other.name;
@@ -1011,6 +1015,10 @@ impl Value {
 
     fn label(&self, labels: &[Label]) -> Option<&Vec<String>> {
         labels.iter().find_map(|label| self.labels.get(label))
+    }
+
+    fn file_target(&self) -> Option<String> {
+        self.literal.clone().or_else(|| self.path_key.clone())
     }
 }
 
@@ -1326,6 +1334,7 @@ impl Evaluator<'_> {
                 value.name = None;
                 value.literal = None;
                 value.path_hint = None;
+                value.path_key = None;
                 value
             }
             Expr::Combine(parts) => {
@@ -1667,25 +1676,47 @@ impl Evaluator<'_> {
             value.literal = Some("$HOME".to_owned());
             return value;
         }
+        if matches!(normalized, "os.tmpdir") {
+            return Value::named("os.tmpdir()".to_owned());
+        }
         if matches!(normalized, "path.join" | "path.resolve") {
             let mut value = Value::default();
             let mut segments = Vec::new();
             let mut complete = true;
+            let mut key_parts = Vec::new();
             for arg in &args {
                 value.merge(arg.clone());
-                if let Some(segment) = arg.literal.as_ref().or(arg.path_hint.as_ref()) {
+                if let Some(segment) = &arg.literal {
                     segments.push(segment.trim_matches('/'));
+                    key_parts.push(format!("literal:{segment}"));
+                } else if let Some(segment) = &arg.path_hint {
+                    segments.push(segment.trim_matches('/'));
+                    complete = false;
+                    if let Some(key) = &arg.path_key {
+                        key_parts.push(format!("path:{key}"));
+                    } else if let Some(name) = &arg.name {
+                        key_parts.push(format!("value:{name}"));
+                    }
                 } else {
                     complete = false;
+                    if let Some(key) = &arg.path_key {
+                        key_parts.push(format!("path:{key}"));
+                    } else if let Some(name) = &arg.name {
+                        key_parts.push(format!("value:{name}"));
+                    }
                 }
             }
             let path = segments.join("/");
             if complete {
                 value.literal = Some(path);
+                value.path_key = None;
             } else {
                 value.literal = None;
                 if !path.is_empty() {
                     value.path_hint = Some(path);
+                }
+                if key_parts.len() == args.len() {
+                    value.path_key = Some(format!("{normalized}({})", key_parts.join(",")));
                 }
             }
             return value;
@@ -1771,7 +1802,7 @@ impl Evaluator<'_> {
         }
         if normalized == "fs.createWriteStream" {
             let mut stream = Value::named("file-stream".to_owned());
-            stream.literal = args.first().and_then(|value| value.literal.clone());
+            stream.literal = args.first().and_then(Value::file_target);
             return stream;
         }
         if normalized.ends_with(".pipe")
@@ -1793,11 +1824,14 @@ impl Evaluator<'_> {
         if matches!(
             normalized,
             "fs.writeFile" | "fs.writeFileSync" | "fs.promises.writeFile" | "fs/promises.writeFile"
-        ) && let (Some(target), Some(contents)) = (
-            args.first().and_then(|value| value.literal.clone()),
-            args.get(1),
-        ) {
-            if persistence_path(&target) {
+        ) && let (Some(target), Some(contents)) =
+            (args.first().and_then(Value::file_target), args.get(1))
+        {
+            if args
+                .first()
+                .and_then(|value| value.literal.as_deref())
+                .is_some_and(persistence_path)
+            {
                 self.findings.push(Finding {
                     id: "JS-PERSISTENCE-WRITE".to_owned(),
                     severity: Severity::High,
@@ -1830,8 +1864,8 @@ impl Evaluator<'_> {
         if matches!(
             normalized,
             "fs.chmod" | "fs.chmodSync" | "fs.promises.chmod" | "fs/promises.chmod"
-        ) && let Some(target) = args.first().and_then(|value| value.literal.as_deref())
-            && let Some(written) = self.written.get_mut(target)
+        ) && let Some(target) = args.first().and_then(Value::file_target)
+            && let Some(written) = self.written.get_mut(&target)
         {
             *written = written
                 .clone()
@@ -1900,8 +1934,8 @@ impl Evaluator<'_> {
             {
                 self.emit(ChainRule::RemoteProcess, path, line, name, route);
             }
-            if let Some(target) = args.first().and_then(|arg| arg.literal.as_deref())
-                && let Some(written) = self.written.get(target)
+            if let Some(target) = args.first().and_then(Value::file_target)
+                && let Some(written) = self.written.get(&target)
                 && let Some(route) = written
                     .label(&[Label::DecodedRemote, Label::Remote])
                     .cloned()

