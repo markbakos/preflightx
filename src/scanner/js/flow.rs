@@ -1,4 +1,4 @@
-use super::{ModuleFacts, semantic::static_string};
+use super::{ModuleFacts, semantic::capability, semantic::static_string};
 use crate::model::{Confidence, Finding, Severity};
 use crate::scanner::graph::resolve_import;
 use oxc_ast::ast::{
@@ -8,6 +8,27 @@ use oxc_ast::ast::{
     PropertyKey, Statement, VariableDeclaration,
 };
 use std::collections::BTreeMap;
+
+fn indirect_api_target(name: &str) -> Option<String> {
+    let target = name
+        .strip_suffix(".call")
+        .or_else(|| name.strip_suffix(".apply"))?;
+    let target = if let Some(import) = target.strip_prefix("import:") {
+        let (specifier, exported) = import.rsplit_once('#')?;
+        let exported = exported
+            .strip_prefix("*.")
+            .or_else(|| exported.strip_prefix("default."))
+            .unwrap_or(exported);
+        if matches!(exported, "*" | "default") {
+            specifier.to_owned()
+        } else {
+            format!("{specifier}.{exported}")
+        }
+    } else {
+        target.to_owned()
+    };
+    capability(&target).map(|_| target)
+}
 
 #[derive(Clone, Debug)]
 pub struct ModuleFlow {
@@ -271,7 +292,9 @@ impl Lower<'_> {
                         ObjectPropertyKind::ObjectProperty(property) => {
                             Some((self.key(&property.key)?, self.expr(&property.value)))
                         }
-                        _ => None,
+                        ObjectPropertyKind::SpreadProperty(property) => {
+                            Some(("*".to_owned(), self.expr(&property.argument)))
+                        }
                     })
                     .collect(),
             ),
@@ -317,9 +340,12 @@ impl Lower<'_> {
     }
 
     fn argument(&self, argument: &Argument<'_>) -> Expr {
-        match argument.as_expression() {
-            Some(expression) => self.expr(expression),
-            None => Expr::Unknown,
+        match argument {
+            Argument::SpreadElement(spread) => self.expr(&spread.argument),
+            _ => argument
+                .as_expression()
+                .map(|expression| self.expr(expression))
+                .unwrap_or(Expr::Unknown),
         }
     }
 
@@ -1338,13 +1364,19 @@ impl Evaluator<'_> {
                 value
             }
             Expr::Object(properties) => {
-                let mut value = Value::default();
+                let mut object = Value::default();
                 for (name, expression) in properties {
                     let field = self.eval(path, expression, environment, depth);
-                    value.merge(field.clone());
-                    value.fields.insert(name.clone(), field);
+                    if name == "*" {
+                        for (property, spread_value) in &field.fields {
+                            object.fields.insert(property.clone(), spread_value.clone());
+                        }
+                    } else {
+                        object.fields.insert(name.clone(), field.clone());
+                    }
+                    object.merge(field);
                 }
-                value
+                object
             }
             Expr::Array(items) => {
                 let mut value = Value::default();
@@ -1392,8 +1424,19 @@ impl Evaluator<'_> {
                     .iter()
                     .map(|arg| self.eval(path, arg, environment, depth))
                     .collect::<Vec<_>>();
-                if matches!(callee.as_ref(), Expr::Member(_, _)) && !function.labels.is_empty() {
+                let indirect_api = function
+                    .name
+                    .as_deref()
+                    .and_then(indirect_api_target)
+                    .is_some();
+                if !indirect_api
+                    && matches!(callee.as_ref(), Expr::Member(_, _))
+                    && !function.labels.is_empty()
+                {
                     args.insert(0, function.clone());
+                }
+                if indirect_api && !args.is_empty() {
+                    args.remove(0);
                 }
                 if function.name.as_deref() == Some("Object.assign")
                     && let Some(Expr::Name(target_name)) = arguments.first()
@@ -1617,6 +1660,8 @@ impl Evaluator<'_> {
             })
             .unwrap_or_else(|| name.to_owned());
         let name = name.as_str();
+        let indirect_name = indirect_api_target(name);
+        let name = indirect_name.as_deref().unwrap_or(name);
         let normalized = name.strip_prefix("node:").unwrap_or(name);
         let file_path = self.file_path(path).to_owned();
         let source = format!("source: {file_path}:{line} {name}");

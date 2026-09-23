@@ -95,6 +95,24 @@ pub fn analyze(path: &str, bytes: &[u8], text: Option<&str>) -> RawAnalysis {
         {
             signals.push("virtual-machine environment check".to_owned());
         }
+        if text.contains("navigator.language")
+            || text.contains("process.env.LANG")
+            || text.contains("Intl.DateTimeFormat")
+        {
+            signals.push("locale or regional environment check".to_owned());
+        }
+        if ["tasklist", "Get-Process", "ps aux", "/proc/"]
+            .iter()
+            .any(|marker| text.contains(marker))
+            && ["Wireshark", "ProcessHacker", "x64dbg", "OllyDbg", "Procmon"]
+                .iter()
+                .any(|marker| text.contains(marker))
+        {
+            signals.push("security-tool process enumeration check".to_owned());
+        }
+        if has_long_delay(text) {
+            signals.push("long timer delay".to_owned());
+        }
         if text.contains("Invoke-WebRequest") || text.contains("Invoke-Expression") {
             signals.push("PowerShell download or execution primitive".to_owned());
         }
@@ -227,6 +245,35 @@ fn longest_run(bytes: &[u8], predicate: impl Fn(u8) -> bool) -> usize {
     longest
 }
 
+fn has_long_delay(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    ["setTimeout", "setInterval"].iter().any(|name| {
+        text.match_indices(name).any(|(offset, _)| {
+            let end = (offset + name.len() + 128).min(bytes.len());
+            let mut cursor = offset + name.len();
+            while cursor < end {
+                if !bytes[cursor].is_ascii_digit() {
+                    cursor += 1;
+                    continue;
+                }
+                let start = cursor;
+                while cursor < end && bytes[cursor].is_ascii_digit() {
+                    cursor += 1;
+                }
+                if cursor - start >= 4
+                    && std::str::from_utf8(&bytes[start..cursor])
+                        .ok()
+                        .and_then(|digits| digits.parse::<u64>().ok())
+                        .is_some_and(|delay| delay >= 5_000)
+                {
+                    return true;
+                }
+            }
+            false
+        })
+    })
+}
+
 fn is_base64_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
 }
@@ -279,5 +326,42 @@ mod tests {
                 .iter()
                 .any(|finding| finding.id == "RAW-CONTENT-AFTER-EOF")
         );
+    }
+
+    #[test]
+    fn records_anti_analysis_signals_without_escalating_them_alone() {
+        let text = "if (navigator.language !== 'en') debugger; if (navigator.webdriver) process.exit(); if (VirtualBox) Get-Process | x64dbg; setTimeout(run, 10000);";
+        let analysis = analyze("main.js", text.as_bytes(), Some(text));
+        assert!(
+            analysis
+                .signals
+                .iter()
+                .any(|signal| signal == "locale or regional environment check")
+        );
+        assert!(
+            analysis
+                .signals
+                .iter()
+                .any(|signal| signal == "anti-debugging or automation check")
+        );
+        assert!(
+            analysis
+                .signals
+                .iter()
+                .any(|signal| signal == "long timer delay")
+        );
+        assert!(
+            analysis
+                .signals
+                .iter()
+                .any(|signal| signal == "virtual-machine environment check")
+        );
+        assert!(
+            analysis
+                .signals
+                .iter()
+                .any(|signal| signal == "security-tool process enumeration check")
+        );
+        assert!(analysis.findings.is_empty());
     }
 }

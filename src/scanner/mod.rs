@@ -19,6 +19,7 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
     let mut modules = Vec::new();
     let mut roots = Vec::new();
     let mut semantic_bytes = 0usize;
+    let mut semantic_limit_reported = false;
 
     let mut walk = walker::walk(path, limits, |input| {
         let Some(bytes) = input.bytes else {
@@ -71,10 +72,13 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
         for module in javascript.modules {
             let size = module.source_bytes;
             if modules.len() >= 10_000 || semantic_bytes.saturating_add(size) > 64 * 1024 * 1024 {
-                analyzer_incomplete.push(format!(
-                    "JS/TS global semantic analysis limit reached before {}",
-                    input.relative
-                ));
+                if !semantic_limit_reported {
+                    analyzer_incomplete.push(format!(
+                        "JS/TS global semantic analysis limit reached before {}; additional modules were omitted",
+                        input.relative
+                    ));
+                    semantic_limit_reported = true;
+                }
             } else {
                 semantic_bytes += size;
                 modules.push(module);

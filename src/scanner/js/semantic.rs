@@ -206,6 +206,40 @@ impl Collector<'_> {
         }
     }
 
+    fn call_name(&self, expression: &Expression<'_>) -> Option<String> {
+        let (receiver, method) = match expression {
+            Expression::StaticMemberExpression(member) => {
+                (Some(&member.object), member.property.name.to_string())
+            }
+            Expression::ComputedMemberExpression(member) => (
+                Some(&member.object),
+                static_string(&member.expression).unwrap_or_default(),
+            ),
+            Expression::ChainExpression(chain) => match &chain.expression {
+                oxc_ast::ast::ChainElement::CallExpression(call) => {
+                    return self.call_name(&call.callee);
+                }
+                oxc_ast::ast::ChainElement::StaticMemberExpression(member) => {
+                    (Some(&member.object), member.property.name.to_string())
+                }
+                oxc_ast::ast::ChainElement::ComputedMemberExpression(member) => (
+                    Some(&member.object),
+                    static_string(&member.expression).unwrap_or_default(),
+                ),
+                _ => return self.name(expression),
+            },
+            _ => return self.name(expression),
+        };
+        if matches!(method.as_str(), "call" | "apply")
+            && let Some(receiver) = receiver.and_then(|receiver| self.name(receiver))
+            && capability(&receiver).is_some()
+        {
+            Some(receiver)
+        } else {
+            self.name(expression)
+        }
+    }
+
     fn imported_binding(&mut self, symbol: Option<SymbolId>, name: String) {
         if let Some(symbol) = symbol {
             self.aliases.insert(symbol, name);
@@ -344,7 +378,7 @@ impl<'a> Visit<'a> for Collector<'_> {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if let Some(name) = self.name(&call.callee) {
+        if let Some(name) = self.call_name(&call.callee) {
             if name == "require" {
                 if let Some(specifier) = call.arguments.first().and_then(argument_string) {
                     self.push_import(&specifier, call.span);
@@ -431,7 +465,7 @@ pub(super) fn static_string(expression: &Expression<'_>) -> Option<String> {
     }
 }
 
-fn capability(name: &str) -> Option<Capability> {
+pub(super) fn capability(name: &str) -> Option<Capability> {
     match name {
         "eval"
         | "Function"

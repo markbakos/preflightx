@@ -28,6 +28,34 @@ pub struct GraphResult {
     pub reachable: BTreeMap<String, Vec<String>>,
 }
 
+fn obfuscation_category(signal: &str) -> Option<usize> {
+    if signal.starts_with("_0x-style identifiers:")
+        || signal.starts_with("unicode escape sequences:")
+        || matches!(
+            signal,
+            "character-code string construction" | "possible XOR string decoder"
+        )
+    {
+        Some(0)
+    } else if signal.starts_with("large base64-like sequence:")
+        || signal.starts_with("large hexadecimal sequence:")
+        || signal.starts_with("high-entropy text:")
+    {
+        Some(1)
+    } else if matches!(
+        signal,
+        "anti-debugging or automation check"
+            | "virtual-machine environment check"
+            | "locale or regional environment check"
+            | "security-tool process enumeration check"
+            | "long timer delay"
+    ) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
 pub fn roots(path: &str, text: Option<&str>, roles: &[String]) -> RootAnalysis {
     let mut roots = Vec::new();
     let mut limit_reached = false;
@@ -542,21 +570,54 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root], files: &[FileRecord]) -> G
         });
         if let (Some(route), Some(call), Some(record)) =
             (route, dangerous, file_records.get(module.path.as_str()))
-            && let Some(signal) = record.raw_signals.iter().find(|signal| {
-                signal.starts_with("code follows ") || signal.contains("logical EOF")
-            })
         {
-            findings.push(Finding {
+            let hidden = record.raw_signals.iter().find(|signal| {
+                signal.starts_with("code follows ") || signal.contains("logical EOF")
+            });
+            let mut categories = [false; 3];
+            let mut obfuscation = Vec::new();
+            for signal in &record.raw_signals {
+                if let Some(category) = obfuscation_category(signal)
+                    && !categories[category]
+                {
+                    categories[category] = true;
+                    obfuscation.push(signal);
+                    if obfuscation.len() == 2 {
+                        break;
+                    }
+                }
+            }
+            let execution = module.calls.iter().find(|candidate| {
+                matches!(
+                    candidate.capability,
+                    Some(Capability::DynamicCode | Capability::Process)
+                ) && candidate
+                    .function
+                    .as_ref()
+                    .is_none_or(|name| called_functions.contains(name))
+            });
+            if hidden.is_some() || (obfuscation.len() == 2 && execution.is_some()) {
+                let relevant_call = execution.unwrap_or(call);
+                let mut evidence = route.clone();
+                evidence.extend(
+                    hidden
+                        .into_iter()
+                        .chain(obfuscation.iter().copied())
+                        .map(|signal| format!("concealment: {signal}")),
+                );
+                evidence.push(format!("capability: {}", relevant_call.name));
+                findings.push(Finding {
                     id: "JS-CONCEALED-EXECUTION".to_owned(),
                     severity: Severity::High,
                     confidence: Confidence::High,
                     score: 88,
-                    title: "Reachable execution capability is visually concealed".to_owned(),
-                    message: "Executable JavaScript combines an evidenced execution route, concealment, and a code or process execution capability.".to_owned(),
+                    title: "Reachable execution capability is concealed or obfuscated".to_owned(),
+                    message: "Executable JavaScript combines an evidenced execution route, concealment or multiple obfuscation signals, and a code or process execution capability.".to_owned(),
                     file: Some(module.path.clone()),
-                    line: Some(call.line),
-                    evidence: route.iter().cloned().chain([format!("concealment: {signal}"), format!("capability: {}", call.name)]).collect(),
+                    line: Some(relevant_call.line),
+                    evidence,
                 });
+            }
         }
         if disguised && let Some(route) = route {
             findings.push(Finding {
