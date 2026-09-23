@@ -81,6 +81,10 @@ pub const RULES: &[Rule] = &[
         description: "JavaScript contains a process execution capability; the call alone does not prove maliciousness.",
     },
     Rule {
+        id: "JS-PERSISTENCE-COMMAND",
+        description: "JavaScript invokes a recognized command that registers automatic startup.",
+    },
+    Rule {
         id: "JS-PERSISTENCE-WRITE",
         description: "JavaScript writes to a recognized automatic startup location.",
     },

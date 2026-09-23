@@ -65,6 +65,35 @@ pub fn roots(path: &str, text: Option<&str>, roles: &[String]) -> Vec<Root> {
             }
         }
     }
+    if path == ".devcontainer/devcontainer.json"
+        && let Some(value) = text.and_then(|text| json5::from_str::<Value>(text).ok())
+    {
+        for hook in [
+            "initializeCommand",
+            "onCreateCommand",
+            "updateContentCommand",
+            "postCreateCommand",
+            "postStartCommand",
+            "postAttachCommand",
+        ] {
+            let Some(commands) = value.get(hook) else {
+                continue;
+            };
+            let commands: Vec<&str> = match commands {
+                Value::String(command) => vec![command],
+                Value::Array(commands) => commands.iter().filter_map(Value::as_str).collect(),
+                Value::Object(commands) => commands.values().filter_map(Value::as_str).collect(),
+                _ => Vec::new(),
+            };
+            for command in commands {
+                roots.push(Root {
+                    file: command_target(command).unwrap_or_default(),
+                    trigger: format!("devcontainer {hook}"),
+                    line: text.and_then(|text| find_line(text, hook)),
+                });
+            }
+        }
+    }
     if roles
         .iter()
         .any(|role| role == "ci_config" || role == "build_script")
@@ -164,6 +193,13 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root], files: &[FileRecord]) -> G
                 break;
             }
             if !import.specifier.starts_with('.') {
+                if import.specifier.starts_with("<dynamic ") {
+                    unresolved.push(format!(
+                        "{}:{} -> {} (dynamic module target unresolved)",
+                        module.path, import.line, import.specifier
+                    ));
+                    continue;
+                }
                 if !import.specifier.starts_with("node:")
                     && !matches!(
                         import.specifier.as_str(),

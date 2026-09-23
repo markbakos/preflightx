@@ -43,6 +43,7 @@ pub enum Expr {
     Bool(bool),
     Member(Box<Expr>, String),
     Call(Box<Expr>, Vec<Expr>, u64),
+    Then(Box<Expr>, Binding, Vec<Stmt>),
     Object(Vec<(String, Expr)>),
     Combine(Vec<Expr>),
     Assign(String, Box<Expr>),
@@ -105,13 +106,23 @@ impl Lower<'_> {
             Expression::Identifier(value) => Expr::Name(value.name.to_string()),
             Expression::StringLiteral(value) => Expr::String(value.value.to_string()),
             Expression::BooleanLiteral(value) => Expr::Bool(value.value),
-            Expression::TemplateLiteral(value) if value.expressions.is_empty() => Expr::String(
-                value
-                    .quasis
-                    .iter()
-                    .map(|part| part.value.raw.as_str())
-                    .collect(),
-            ),
+            Expression::TemplateLiteral(value) => {
+                let mut parts = Vec::new();
+                for (index, quasi) in value.quasis.iter().enumerate() {
+                    parts.push(Expr::String(
+                        quasi
+                            .value
+                            .cooked
+                            .as_ref()
+                            .unwrap_or(&quasi.value.raw)
+                            .to_string(),
+                    ));
+                    if let Some(expression) = value.expressions.get(index) {
+                        parts.push(self.expr(expression));
+                    }
+                }
+                Expr::Combine(parts)
+            }
             Expression::StaticMemberExpression(member) => Expr::Member(
                 Box::new(self.expr(&member.object)),
                 member.property.name.to_string(),
@@ -123,14 +134,39 @@ impl Lower<'_> {
                     Expr::Unknown
                 }
             }
-            Expression::CallExpression(call) => Expr::Call(
-                Box::new(self.expr(&call.callee)),
-                call.arguments
-                    .iter()
-                    .map(|argument| self.argument(argument))
-                    .collect(),
-                self.line(call.span.start),
-            ),
+            Expression::CallExpression(call) => {
+                if let Expression::StaticMemberExpression(member) = &call.callee
+                    && member.property.name == "then"
+                    && let Some(Expression::ArrowFunctionExpression(callback)) =
+                        call.arguments.first().and_then(Argument::as_expression)
+                {
+                    let parameter = callback
+                        .params
+                        .items
+                        .first()
+                        .map(|item| self.binding(&item.pattern))
+                        .unwrap_or(Binding::Ignore);
+                    let body = match &callback.body {
+                        oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => {
+                            self.statements(&body.statements, &mut BTreeMap::new())
+                        }
+                        _ => callback
+                            .body
+                            .as_expression()
+                            .map(|body| vec![Stmt::Return(self.expr(body))])
+                            .unwrap_or_default(),
+                    };
+                    return Expr::Then(Box::new(self.expr(&member.object)), parameter, body);
+                }
+                Expr::Call(
+                    Box::new(self.expr(&call.callee)),
+                    call.arguments
+                        .iter()
+                        .map(|argument| self.argument(argument))
+                        .collect(),
+                    self.line(call.span.start),
+                )
+            }
             Expression::NewExpression(call) => Expr::Call(
                 Box::new(self.expr(&call.callee)),
                 call.arguments
@@ -301,6 +337,42 @@ impl Lower<'_> {
                     .map(|alternate| self.statement(alternate, functions))
                     .unwrap_or_default(),
             )],
+            // ponytail: One loop pass catches direct sinks; add a bounded fixpoint when loop-carried flows are needed.
+            Statement::WhileStatement(loop_) => vec![Stmt::Branch(
+                self.expr(&loop_.test),
+                self.statement(&loop_.body, functions),
+                Vec::new(),
+            )],
+            Statement::DoWhileStatement(loop_) => self.statement(&loop_.body, functions),
+            Statement::ForStatement(loop_) => {
+                let mut body = self.statement(&loop_.body, functions);
+                if let Some(update) = &loop_.update {
+                    body.push(Stmt::Expr(self.expr(update)));
+                }
+                vec![Stmt::Branch(
+                    loop_
+                        .test
+                        .as_ref()
+                        .map(|test| self.expr(test))
+                        .unwrap_or(Expr::Bool(true)),
+                    body,
+                    Vec::new(),
+                )]
+            }
+            Statement::TryStatement(try_) => {
+                let mut body = vec![Stmt::Branch(
+                    Expr::Unknown,
+                    self.statements(&try_.block.body, functions),
+                    try_.handler
+                        .as_ref()
+                        .map(|handler| self.statements(&handler.body.body, functions))
+                        .unwrap_or_default(),
+                )];
+                if let Some(finalizer) = &try_.finalizer {
+                    body.extend(self.statements(&finalizer.body, functions));
+                }
+                body
+            }
             _ => Vec::new(),
         }
     }
@@ -520,20 +592,19 @@ pub fn analyze_flows(
         .collect::<Vec<_>>();
     for execution in remote {
         let same_route = secrets.iter().find(|secret| {
-            secret.file == execution.file
-                || execution
-                    .file
-                    .as_ref()
-                    .and_then(|file| reachable.get(file))
-                    .and_then(|route| route.first())
-                    .is_some_and(|trigger| {
-                        secret
-                            .file
-                            .as_ref()
-                            .and_then(|file| reachable.get(file))
-                            .and_then(|route| route.first())
-                            == Some(trigger)
-                    })
+            execution
+                .file
+                .as_ref()
+                .and_then(|file| reachable.get(file))
+                .and_then(|route| route.first())
+                .is_some_and(|trigger| {
+                    secret
+                        .file
+                        .as_ref()
+                        .and_then(|file| reachable.get(file))
+                        .and_then(|route| route.first())
+                        == Some(trigger)
+                })
         });
         if let Some(secret) = same_route {
             evaluator.findings.push(Finding {
@@ -756,6 +827,13 @@ impl Evaluator<'_> {
                     depth,
                 )
             }
+            Expr::Then(receiver, parameter, body) => {
+                let value = self.eval(path, receiver, environment, depth);
+                let mut scope = environment.clone();
+                self.bind(parameter, value, &mut scope);
+                self.run(path, body, &mut scope, depth + 1)
+                    .unwrap_or_default()
+            }
             Expr::Unknown => Value::default(),
         }
     }
@@ -772,17 +850,28 @@ impl Evaluator<'_> {
         let module = self.modules.get(path).copied();
         if let Some(module) = module {
             if let Some(function) = module.flow.functions.get(name).cloned() {
-                return self.call_function(path, &function, args, environment.clone(), depth + 1);
+                return self.call_function(
+                    path,
+                    name,
+                    &function,
+                    args,
+                    environment.clone(),
+                    depth + 1,
+                );
             }
             if let Some(import) = name.strip_prefix("import:")
                 && let Some((specifier, exported)) = import.rsplit_once('#')
                 && specifier.starts_with('.')
                 && let Some(target) = resolve_import(path, specifier, &self.modules)
-                && let Some(function) = self.modules[target].flow.functions.get(exported).cloned()
+                && let Some(function) = self.modules[target]
+                    .flow
+                    .functions
+                    .get(exported.strip_prefix("*.").unwrap_or(exported))
+                    .cloned()
             {
                 let target = target.to_owned();
                 let scope = self.imports(self.modules[target.as_str()]);
-                return self.call_function(&target, &function, args, scope, depth + 1);
+                return self.call_function(&target, exported, &function, args, scope, depth + 1);
             }
         }
         let name = name
@@ -837,7 +926,10 @@ impl Evaluator<'_> {
             self.exfiltration(path, line, name, &args);
             return Value::labeled(Label::Remote, source);
         }
-        if matches!(normalized, "fs.readFile" | "fs.readFileSync") {
+        if matches!(
+            normalized,
+            "fs.readFile" | "fs.readFileSync" | "fs.promises.readFile" | "fs/promises.readFile"
+        ) {
             let target = args
                 .first()
                 .and_then(|value| value.literal.as_deref())
@@ -896,12 +988,13 @@ impl Evaluator<'_> {
                 .unwrap_or_default()
                 .propagate(format!("transform: {path}:{line} {name}"));
         }
-        if matches!(normalized, "fs.writeFile" | "fs.writeFileSync")
-            && let (Some(target), Some(contents)) = (
-                args.first().and_then(|value| value.literal.clone()),
-                args.get(1),
-            )
-        {
+        if matches!(
+            normalized,
+            "fs.writeFile" | "fs.writeFileSync" | "fs.promises.writeFile" | "fs/promises.writeFile"
+        ) && let (Some(target), Some(contents)) = (
+            args.first().and_then(|value| value.literal.clone()),
+            args.get(1),
+        ) {
             if persistence_path(&target) {
                 self.findings.push(Finding {
                     id: "JS-PERSISTENCE-WRITE".to_owned(),
@@ -964,6 +1057,29 @@ impl Evaluator<'_> {
                 | "Bun.spawn"
                 | "Deno.Command"
         ) {
+            if let Some(command) = args.first().and_then(|arg| arg.literal.as_deref())
+                && persistence_command(command)
+            {
+                self.findings.push(Finding {
+                    id: "JS-PERSISTENCE-COMMAND".to_owned(),
+                    severity: Severity::High,
+                    confidence: Confidence::High,
+                    score: 85,
+                    title: "JavaScript invokes an automatic-startup command".to_owned(),
+                    message: "A process execution API receives a recognized persistence command."
+                        .to_owned(),
+                    file: Some(path.to_owned()),
+                    line: Some(line),
+                    evidence: self
+                        .reachable
+                        .get(path)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .chain([format!("command: {command}")])
+                        .collect(),
+                });
+            }
             if let Some(route) = args
                 .iter()
                 .find_map(|arg| arg.label(&[Label::DecodedRemote, Label::Remote]))
@@ -983,7 +1099,13 @@ impl Evaluator<'_> {
             return args
                 .first()
                 .and_then(|arg| arg.literal.clone())
-                .map(Value::named)
+                .map(|specifier| {
+                    if specifier.starts_with('.') {
+                        Value::named(format!("import:{specifier}#*"))
+                    } else {
+                        Value::named(specifier)
+                    }
+                })
                 .unwrap_or_default();
         }
         Value::default()
@@ -992,6 +1114,7 @@ impl Evaluator<'_> {
     fn call_function(
         &mut self,
         path: &str,
+        name: &str,
         function: &Function,
         args: Vec<Value>,
         mut scope: BTreeMap<String, Value>,
@@ -1006,7 +1129,7 @@ impl Evaluator<'_> {
         }
         self.run(path, &function.body, &mut scope, depth)
             .unwrap_or_default()
-            .propagate(format!("return: {path}"))
+            .propagate(format!("return: {path} {name}"))
     }
 
     fn exfiltration(&mut self, path: &str, line: u64, sink: &str, args: &[Value]) {
@@ -1079,4 +1202,18 @@ fn persistence_path(path: &str) -> bool {
     ]
     .iter()
     .any(|marker| path.contains(marker))
+}
+
+fn persistence_command(command: &str) -> bool {
+    let command = command.trim().to_ascii_lowercase();
+    [
+        "crontab ",
+        "reg add ",
+        "reg.exe add ",
+        "schtasks /create",
+        "launchctl load ",
+        "systemctl --user enable ",
+    ]
+    .iter()
+    .any(|prefix| command.starts_with(prefix))
 }

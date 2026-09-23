@@ -314,10 +314,13 @@ impl<'a> Visit<'a> for Collector<'_> {
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if let Some(name) = self.name(&call.callee) {
-            if name == "require"
-                && let Some(specifier) = call.arguments.first().and_then(argument_string)
-            {
-                self.push_import(&specifier, call.span);
+            if name == "require" {
+                if let Some(specifier) = call.arguments.first().and_then(argument_string) {
+                    self.push_import(&specifier, call.span);
+                } else {
+                    self.push_import("<dynamic require>", call.span);
+                    self.push_call("dynamic require".to_owned(), call.span);
+                }
             }
             self.push_call(name, call.span);
         }
@@ -334,6 +337,8 @@ impl<'a> Visit<'a> for Collector<'_> {
     fn visit_import_expression(&mut self, import: &ImportExpression<'a>) {
         if let Some(specifier) = static_string(&import.source) {
             self.push_import(&specifier, import.span);
+        } else {
+            self.push_import("<dynamic import>", import.span);
         }
         self.push_call("import".to_owned(), import.span);
         walk::walk_import_expression(self, import);
@@ -393,7 +398,8 @@ fn capability(name: &str) -> Option<Capability> {
         | "node:vm.runInContext"
         | "node:vm.Script"
         | "process.dlopen"
-        | "import" => Some(Capability::DynamicCode),
+        | "import"
+        | "dynamic require" => Some(Capability::DynamicCode),
         "child_process.exec"
         | "child_process.execSync"
         | "child_process.spawn"
@@ -409,16 +415,28 @@ fn capability(name: &str) -> Option<Capability> {
         "fetch" | "axios" | "axios.get" | "axios.post" | "http.request" | "https.request"
         | "node:http.request" | "node:https.request" | "got" | "request" | "undici.request"
         | "WebSocket" | "ws" | "net.Socket" | "tls.connect" => Some(Capability::Network),
-        "fs.readFile" | "fs.readFileSync" | "node:fs.readFile" | "node:fs.readFileSync" => {
-            Some(Capability::FileRead)
-        }
+        "fs.readFile"
+        | "fs.readFileSync"
+        | "fs.promises.readFile"
+        | "fs/promises.readFile"
+        | "node:fs.readFile"
+        | "node:fs.readFileSync"
+        | "node:fs/promises.readFile" => Some(Capability::FileRead),
         "process.env" | "os.homedir" | "node:os.homedir" => Some(Capability::Secret),
-        "fs.writeFile" | "fs.writeFileSync" | "node:fs.writeFile" | "node:fs.writeFileSync" => {
-            Some(Capability::FileWrite)
-        }
-        "fs.chmod" | "fs.chmodSync" | "node:fs.chmod" | "node:fs.chmodSync" => {
-            Some(Capability::Chmod)
-        }
+        "fs.writeFile"
+        | "fs.writeFileSync"
+        | "fs.promises.writeFile"
+        | "fs/promises.writeFile"
+        | "node:fs.writeFile"
+        | "node:fs.writeFileSync"
+        | "node:fs/promises.writeFile" => Some(Capability::FileWrite),
+        "fs.chmod"
+        | "fs.chmodSync"
+        | "fs.promises.chmod"
+        | "fs/promises.chmod"
+        | "node:fs.chmod"
+        | "node:fs.chmodSync"
+        | "node:fs/promises.chmod" => Some(Capability::Chmod),
         _ => None,
     }
 }

