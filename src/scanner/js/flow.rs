@@ -52,6 +52,7 @@ pub enum Expr {
     Then(Box<Expr>, Binding, Vec<Stmt>),
     Message(Box<Expr>, Binding, Vec<Stmt>, String),
     Object(Vec<(String, Expr)>),
+    Array(Vec<Expr>),
     Combine(Vec<Expr>),
     Assign(String, Box<Expr>),
     Unknown,
@@ -270,7 +271,7 @@ impl Lower<'_> {
                     })
                     .collect(),
             ),
-            Expression::ArrayExpression(array) => Expr::Combine(
+            Expression::ArrayExpression(array) => Expr::Array(
                 array
                     .elements
                     .iter()
@@ -1315,6 +1316,18 @@ impl Evaluator<'_> {
                 }
                 value
             }
+            Expr::Array(items) => {
+                let mut value = Value::default();
+                for (index, expression) in items.iter().enumerate() {
+                    let item = self.eval(path, expression, environment, depth);
+                    value.merge(item.clone());
+                    value.fields.insert(index.to_string(), item);
+                }
+                value.name = None;
+                value.literal = None;
+                value.path_hint = None;
+                value
+            }
             Expr::Combine(parts) => {
                 let mut combined = Value::default();
                 let mut literal = Some(String::new());
@@ -1503,6 +1516,13 @@ impl Evaluator<'_> {
         let source = format!("source: {file_path}:{line} {name}");
         if normalized == "Object.keys" {
             return Value::default();
+        }
+        if matches!(normalized, "Promise.all" | "Promise.race" | "Promise.any") {
+            return args
+                .first()
+                .cloned()
+                .unwrap_or_default()
+                .propagate(format!("promise aggregation: {file_path}:{line} {name}"));
         }
         if normalized == "Object.entries" {
             let mut entries = Value::default();

