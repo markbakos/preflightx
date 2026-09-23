@@ -1839,7 +1839,14 @@ impl Evaluator<'_> {
             || normalized.ends_with(".toLowerCase")
             || normalized.ends_with(".toUpperCase")
             || normalized.ends_with(".trim")
-            || matches!(normalized, "Object.values")
+            || matches!(
+                normalized,
+                "Object.values"
+                    | "btoa"
+                    | "encodeURI"
+                    | "encodeURIComponent"
+                    | "TextEncoder.encode"
+            )
         {
             return args
                 .first()

