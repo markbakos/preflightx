@@ -1,5 +1,6 @@
 mod analyzers;
 mod classifier;
+mod js;
 mod limits;
 mod raw;
 mod walker;
@@ -24,9 +25,16 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
             ));
             return;
         };
-        let classification =
+        let mut classification =
             classifier::classify(&input.relative, &input.path, &input.metadata, &bytes);
         let metadata = analyzers::analyze(&input.relative, classification.text.as_deref());
+        let javascript = js::analyze(&input.relative, classification.text.as_deref());
+        classification.record.parsed_language = javascript.language;
+        if !javascript.findings.is_empty() {
+            classification
+                .findings
+                .retain(|finding| finding.id != "FILE-EXECUTABLE-CONTENT");
+        }
         append_limited(
             &mut findings,
             classification.findings,
@@ -42,6 +50,13 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
             &mut analyzer_incomplete,
         );
         append_limited(
+            &mut findings,
+            javascript.findings,
+            limits.max_findings,
+            "finding limit reached",
+            &mut analyzer_incomplete,
+        );
+        append_limited(
             &mut dependencies,
             metadata.dependencies,
             limits.max_dependencies,
@@ -49,6 +64,7 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
             &mut analyzer_incomplete,
         );
         analyzer_incomplete.extend(metadata.incomplete_reasons);
+        analyzer_incomplete.extend(javascript.incomplete_reasons);
         files.push(classification.record);
     });
 

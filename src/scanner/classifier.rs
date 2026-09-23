@@ -75,6 +75,7 @@ pub fn classify(relative: &str, path: &Path, metadata: &Metadata, bytes: &[u8]) 
             roles: roles(relative),
             raw_signals: raw.signals,
             content_scanned: true,
+            parsed_language: None,
         },
         findings,
         text,
@@ -101,6 +102,7 @@ pub fn unscanned_record(relative: &str, path: &Path, metadata: &Metadata) -> Fil
         roles: roles(relative),
         raw_signals: Vec::new(),
         content_scanned: false,
+        parsed_language: None,
     }
 }
 
@@ -223,9 +225,10 @@ fn is_non_code_extension(extension: Option<&str>) -> bool {
     )
 }
 
-fn looks_like_executable_text(text: &str) -> bool {
+pub(super) fn looks_like_executable_text(text: &str) -> bool {
     let markers = [
         "require(",
+        "module.exports",
         "child_process",
         "process.env",
         "eval(",

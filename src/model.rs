@@ -77,6 +77,7 @@ pub struct FileRecord {
     pub roles: Vec<String>,
     pub raw_signals: Vec<String>,
     pub content_scanned: bool,
+    pub parsed_language: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

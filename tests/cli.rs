@@ -40,6 +40,34 @@ fn policy_finding_returns_one() {
 }
 
 #[test]
+fn disguised_javascript_is_reported_and_bad_source_is_incomplete() {
+    let root = temporary_directory("javascript");
+    fs::write(
+        root.join("fake.woff2"),
+        b"module.exports = require('child_process');",
+    )
+    .unwrap();
+    fs::write(root.join("broken.ts"), b"const = ;").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "incomplete");
+    assert_eq!(report["files"][1]["parsed_language"], "javascript");
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["id"] == "FILE-PARSEABLE-JAVASCRIPT" && finding["file"] == "fake.woff2"
+            })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn incomplete_and_invalid_invocations_use_distinct_exit_codes() {
     let missing = run(&["definitely-does-not-exist"]);
     let invalid = run(&[".", "--online"]);

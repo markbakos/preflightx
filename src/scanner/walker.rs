@@ -337,6 +337,7 @@ fn inspect_symlink(root: &Path, path: &Path, relative: String, result: &mut Walk
         roles: Vec::new(),
         raw_signals: Vec::new(),
         content_scanned: false,
+        parsed_language: None,
     });
 
     if escapes {
@@ -388,6 +389,7 @@ fn inspect_special(path: PathBuf, relative: String, result: &mut WalkResult) {
         roles: Vec::new(),
         raw_signals: Vec::new(),
         content_scanned: false,
+        parsed_language: None,
     });
     result.findings.push(Finding {
         id: "FS-SPECIAL-FILE".to_owned(),
