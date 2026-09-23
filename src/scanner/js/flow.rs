@@ -952,6 +952,7 @@ impl ChainRule {
 struct Value {
     name: Option<String>,
     literal: Option<String>,
+    path_hint: Option<String>,
     labels: BTreeMap<Label, Vec<String>>,
     fields: BTreeMap<String, Value>,
 }
@@ -984,6 +985,9 @@ impl Value {
         }
         if self.literal.is_none() {
             self.literal = other.literal;
+        }
+        if self.path_hint.is_none() {
+            self.path_hint = other.path_hint;
         }
         if self.name.is_none() {
             self.name = other.name;
@@ -1312,6 +1316,7 @@ impl Evaluator<'_> {
             Expr::Combine(parts) => {
                 let mut combined = Value::default();
                 let mut literal = Some(String::new());
+                let mut path_hint = String::new();
                 for part in parts {
                     let part = self.eval(path, part, environment, depth);
                     if let (Some(buffer), Some(text)) = (&mut literal, &part.literal) {
@@ -1319,9 +1324,15 @@ impl Evaluator<'_> {
                     } else {
                         literal = None;
                     }
+                    if let Some(text) = part.literal.as_ref().or(part.path_hint.as_ref()) {
+                        path_hint.push_str(text);
+                    }
                     combined.merge(part);
                 }
                 combined.literal = literal;
+                if combined.literal.is_none() && !path_hint.is_empty() {
+                    combined.path_hint = Some(path_hint);
+                }
                 combined
             }
             Expr::Assign(name, right) => {
@@ -1620,10 +1631,13 @@ impl Evaluator<'_> {
         ) {
             let target = args
                 .first()
-                .and_then(|value| value.literal.as_deref())
+                .and_then(|value| value.literal.as_deref().or(value.path_hint.as_deref()))
                 .unwrap_or("");
             if sensitive_path(target) {
-                return Value::labeled(Label::FileSecret, source);
+                return Value::labeled(
+                    Label::FileSecret,
+                    format!("{source} (path evidence: {target})"),
+                );
             }
         }
         if matches!(normalized, "os.homedir") {
@@ -1634,15 +1648,24 @@ impl Evaluator<'_> {
         if matches!(normalized, "path.join" | "path.resolve") {
             let mut value = Value::default();
             let mut segments = Vec::new();
+            let mut complete = true;
             for arg in &args {
                 value.merge(arg.clone());
-                if let Some(segment) = &arg.literal {
+                if let Some(segment) = arg.literal.as_ref().or(arg.path_hint.as_ref()) {
                     segments.push(segment.trim_matches('/'));
                 } else {
-                    return value;
+                    complete = false;
                 }
             }
-            value.literal = Some(segments.join("/"));
+            let path = segments.join("/");
+            if complete {
+                value.literal = Some(path);
+            } else {
+                value.literal = None;
+                if !path.is_empty() {
+                    value.path_hint = Some(path);
+                }
+            }
             return value;
         }
         if matches!(
