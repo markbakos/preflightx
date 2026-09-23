@@ -1328,6 +1328,12 @@ impl Evaluator<'_> {
                     return Value::named(format!("process.env.{property}"));
                 }
                 let mut value = base.fields.get(property).cloned().unwrap_or(base);
+                if !value.labels.is_empty() {
+                    value = value.propagate(format!(
+                        "property: {file_path} {}",
+                        full_name.as_deref().unwrap_or(property)
+                    ));
+                }
                 value.name = full_name;
                 value
             }
@@ -1510,6 +1516,9 @@ impl Evaluator<'_> {
                         "WebSocket"
                             | "globalThis.WebSocket"
                             | "window.WebSocket"
+                            | "EventSource"
+                            | "globalThis.EventSource"
+                            | "window.EventSource"
                             | "ws"
                             | "http.response"
                             | "network.socket"
@@ -1690,6 +1699,9 @@ impl Evaluator<'_> {
                 | "WebSocket"
                 | "globalThis.WebSocket"
                 | "window.WebSocket"
+                | "EventSource"
+                | "globalThis.EventSource"
+                | "window.EventSource"
                 | "ws"
                 | "socket.io"
                 | "socket.io-client"
@@ -1716,6 +1728,11 @@ impl Evaluator<'_> {
                 "WebSocket" | "globalThis.WebSocket" | "window.WebSocket" | "ws"
             ) {
                 value.name = Some("WebSocket".to_owned());
+            } else if matches!(
+                normalized,
+                "EventSource" | "globalThis.EventSource" | "window.EventSource"
+            ) {
+                value.name = Some("EventSource".to_owned());
             } else if matches!(
                 normalized,
                 "socket.io" | "socket.io-client" | "socket.io-client.io"
