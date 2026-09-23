@@ -33,11 +33,27 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
             classifier::classify(&input.relative, &input.path, &input.metadata, &bytes);
         let metadata = analyzers::analyze(&input.relative, classification.text.as_deref());
         let javascript = js::analyze(&input.relative, classification.text.as_deref());
-        roots.extend(graph::roots(
-            &input.relative,
-            classification.text.as_deref(),
-            &classification.record.roles,
-        ));
+        if roots.len() < graph::MAX_EXECUTION_ROOTS {
+            let root_analysis = graph::roots(
+                &input.relative,
+                classification.text.as_deref(),
+                &classification.record.roles,
+            );
+            if root_analysis.incomplete {
+                analyzer_incomplete.push(format!(
+                    "JS/TS execution root extraction limit reached: {}",
+                    input.relative
+                ));
+            }
+            let available = graph::MAX_EXECUTION_ROOTS.saturating_sub(roots.len());
+            if root_analysis.roots.len() >= available {
+                analyzer_incomplete.push(format!(
+                    "JS/TS global execution root limit of {} reached; remaining roots omitted",
+                    graph::MAX_EXECUTION_ROOTS
+                ));
+            }
+            roots.extend(root_analysis.roots.into_iter().take(available));
+        }
         if let Some(module) = javascript.module {
             let size = classification.text.as_ref().map_or(0, String::len);
             if modules.len() >= 10_000 || semantic_bytes.saturating_add(size) > 64 * 1024 * 1024 {

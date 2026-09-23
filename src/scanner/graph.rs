@@ -5,12 +5,20 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::{Component, Path};
 
 const MAX_EDGES: usize = 50_000;
+pub const MAX_EXECUTION_ROOTS: usize = 50_000;
+const MAX_ROOTS_PER_FILE: usize = 10_000;
+const MAX_COMMAND_DEPTH: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct Root {
     pub file: String,
     pub trigger: String,
     pub line: Option<u64>,
+}
+
+pub struct RootAnalysis {
+    pub roots: Vec<Root>,
+    pub incomplete: bool,
 }
 
 pub struct GraphResult {
@@ -20,28 +28,56 @@ pub struct GraphResult {
     pub reachable: BTreeMap<String, Vec<String>>,
 }
 
-pub fn roots(path: &str, text: Option<&str>, roles: &[String]) -> Vec<Root> {
+pub fn roots(path: &str, text: Option<&str>, roles: &[String]) -> RootAnalysis {
     let mut roots = Vec::new();
+    let mut limit_reached = false;
     if roles.iter().any(|role| role == "executable_config") {
-        roots.push(Root {
-            file: path.to_owned(),
-            trigger: format!("build config {path}"),
-            line: None,
-        });
+        push_root(
+            &mut roots,
+            Root {
+                file: path.to_owned(),
+                trigger: format!("build config {path}"),
+                line: None,
+            },
+            &mut limit_reached,
+        );
     }
     if path.rsplit('/').next() == Some("package.json")
         && let Some(value) = text.and_then(|text| serde_json::from_str::<Value>(text).ok())
         && let Some(scripts) = value.get("scripts").and_then(Value::as_object)
     {
+        // ponytail: keep exact line lookup for small manifests; use a token-position parser if large manifests need line evidence.
+        let line_evidence = scripts.len() <= 64;
         for (name, command) in scripts {
             if let Some(command) = command.as_str() {
-                roots.push(Root {
-                    file: script_target(command, scripts, 0)
-                        .map(|target| resolve_from(path, &target))
-                        .unwrap_or_default(),
-                    trigger: format!("npm {name} ({path})"),
-                    line: text.and_then(|text| find_line(text, &format!("\"{name}\""))),
-                });
+                let trigger = format!("npm {name} ({path})");
+                let line = line_evidence
+                    .then(|| text.and_then(|text| find_line(text, &format!("\"{name}\""))))
+                    .flatten();
+                let targets = script_targets(command, scripts, 0, &mut limit_reached);
+                if targets.is_empty() {
+                    push_root(
+                        &mut roots,
+                        Root {
+                            file: String::new(),
+                            trigger: trigger.clone(),
+                            line,
+                        },
+                        &mut limit_reached,
+                    );
+                } else {
+                    for target in targets {
+                        push_root(
+                            &mut roots,
+                            Root {
+                                file: resolve_from(path, &target),
+                                trigger: trigger.clone(),
+                                line,
+                            },
+                            &mut limit_reached,
+                        );
+                    }
+                }
             }
         }
     }
@@ -49,6 +85,7 @@ pub fn roots(path: &str, text: Option<&str>, roles: &[String]) -> Vec<Root> {
         && let Some(value) = text.and_then(|text| json5::from_str::<Value>(text).ok())
         && let Some(tasks) = value.get("tasks").and_then(Value::as_array)
     {
+        let line = text.and_then(|text| find_line(text, "folderOpen"));
         for task in tasks {
             if task.pointer("/runOptions/runOn").and_then(Value::as_str) != Some("folderOpen") {
                 continue;
@@ -56,12 +93,39 @@ pub fn roots(path: &str, text: Option<&str>, roles: &[String]) -> Vec<Root> {
             let Some(command) = task.get("command").and_then(Value::as_str) else {
                 continue;
             };
-            if let Some(target) = command_target(command) {
-                roots.push(Root {
-                    file: target.trim_start_matches("./").to_owned(),
-                    trigger: "VS Code folderOpen task".to_owned(),
-                    line: text.and_then(|text| find_line(text, "folderOpen")),
-                });
+            let args = task
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|args| {
+                    args.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            let targets = command_targets(&format!("{command} {args}"), &mut limit_reached);
+            if targets.is_empty() {
+                push_root(
+                    &mut roots,
+                    Root {
+                        file: String::new(),
+                        trigger: "VS Code folderOpen task".to_owned(),
+                        line,
+                    },
+                    &mut limit_reached,
+                );
+            } else {
+                for target in targets {
+                    push_root(
+                        &mut roots,
+                        Root {
+                            file: target.trim_start_matches("./").to_owned(),
+                            trigger: "VS Code folderOpen task".to_owned(),
+                            line,
+                        },
+                        &mut limit_reached,
+                    );
+                }
             }
         }
     }
@@ -86,11 +150,32 @@ pub fn roots(path: &str, text: Option<&str>, roles: &[String]) -> Vec<Root> {
                 _ => Vec::new(),
             };
             for command in commands {
-                roots.push(Root {
-                    file: command_target(command).unwrap_or_default(),
-                    trigger: format!("devcontainer {hook}"),
-                    line: text.and_then(|text| find_line(text, hook)),
-                });
+                let targets = command_targets(command, &mut limit_reached);
+                let trigger = format!("devcontainer {hook}");
+                let line = text.and_then(|text| find_line(text, hook));
+                if targets.is_empty() {
+                    push_root(
+                        &mut roots,
+                        Root {
+                            file: String::new(),
+                            trigger: trigger.clone(),
+                            line,
+                        },
+                        &mut limit_reached,
+                    );
+                } else {
+                    for target in targets {
+                        push_root(
+                            &mut roots,
+                            Root {
+                                file: target.trim_start_matches("./").to_owned(),
+                                trigger: trigger.clone(),
+                                line,
+                            },
+                            &mut limit_reached,
+                        );
+                    }
+                }
             }
         }
     }
@@ -102,74 +187,188 @@ pub fn roots(path: &str, text: Option<&str>, roles: &[String]) -> Vec<Root> {
         for (index, line) in text.lines().enumerate() {
             let command = line
                 .trim()
+                .trim_start_matches("- ")
                 .trim_start_matches("run:")
                 .trim_start_matches("RUN ")
+                .trim_start_matches("command:")
+                .trim_start_matches("entrypoint:")
                 .trim();
-            if let Some(target) = command_target(command) {
-                roots.push(Root {
-                    file: if roles.iter().any(|role| role == "ci_config") {
-                        target.trim_start_matches("./").to_owned()
-                    } else {
-                        resolve_from(path, &target)
+            let targets = command_targets(command, &mut limit_reached);
+            let trigger = format!("build or CI command in {path}");
+            if targets.is_empty() {
+                continue;
+            }
+            for target in targets {
+                push_root(
+                    &mut roots,
+                    Root {
+                        file: if roles.iter().any(|role| role == "ci_config") {
+                            target.trim_start_matches("./").to_owned()
+                        } else {
+                            resolve_from(path, &target)
+                        },
+                        trigger: trigger.clone(),
+                        line: Some(index as u64 + 1),
                     },
-                    trigger: format!("build or CI command in {path}"),
-                    line: Some(index as u64 + 1),
-                });
+                    &mut limit_reached,
+                );
             }
         }
     }
-    roots
+    RootAnalysis {
+        roots,
+        incomplete: limit_reached,
+    }
 }
 
-fn script_target(
+fn push_root(roots: &mut Vec<Root>, root: Root, limit_reached: &mut bool) {
+    if roots.len() < MAX_ROOTS_PER_FILE {
+        roots.push(root);
+    } else {
+        *limit_reached = true;
+    }
+}
+
+fn script_targets(
     command: &str,
     scripts: &serde_json::Map<String, Value>,
     depth: usize,
-) -> Option<String> {
-    if depth >= 8 {
-        return None;
+    limit_reached: &mut bool,
+) -> Vec<String> {
+    if depth >= MAX_COMMAND_DEPTH {
+        *limit_reached = true;
+        return Vec::new();
     }
-    if let Some(target) = command_target(command) {
-        return Some(target);
-    }
-    let parts: Vec<_> = command.split_ascii_whitespace().collect();
-    let referenced = match parts.as_slice() {
-        ["npm", "run", name, ..] | ["pnpm", "run", name, ..] | ["yarn", "run", name, ..] => {
-            Some(*name)
+    let mut targets = Vec::new();
+    for part in command.split([';', '|', '&', '\n']) {
+        targets.extend(command_targets_at(part, 0, limit_reached));
+        let parts: Vec<_> = part.split_ascii_whitespace().collect();
+        let referenced = match parts.as_slice() {
+            ["npm", "run", name, ..] | ["pnpm", "run", name, ..] | ["yarn", "run", name, ..] => {
+                Some(*name)
+            }
+            _ => None,
         }
-        _ => None,
-    }?;
-    let nested = scripts.get(referenced)?.as_str()?;
-    script_target(nested, scripts, depth + 1)
+        .and_then(|name| scripts.get(name)?.as_str());
+        if let Some(nested) = referenced {
+            targets.extend(script_targets(nested, scripts, depth + 1, limit_reached));
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
-fn command_target(command: &str) -> Option<String> {
-    let mut parts = command.split_ascii_whitespace().peekable();
-    let mut executable = parts.next()?.trim_matches(['"', '\'']);
-    if executable == "cross-env" || executable == "env" {
-        executable = parts.find(|part| !part.contains('='))?;
+fn command_targets(command: &str, limit_reached: &mut bool) -> Vec<String> {
+    command_targets_at(command, 0, limit_reached)
+}
+
+fn command_targets_at(command: &str, depth: usize, limit_reached: &mut bool) -> Vec<String> {
+    if depth >= MAX_COMMAND_DEPTH {
+        *limit_reached = true;
+        return Vec::new();
+    }
+    // ponytail: separator splitting ignores quoting; use a shell parser if corpus scans show missed command boundaries.
+    let mut targets = command
+        .split([';', '|', '&', '\n'])
+        .flat_map(|part| command_target(part, depth, limit_reached))
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+fn command_target(command: &str, depth: usize, limit_reached: &mut bool) -> Vec<String> {
+    let parts = command
+        .split_ascii_whitespace()
+        .map(|part| part.trim_matches(['"', '\'']))
+        .collect::<Vec<_>>();
+    let mut index = 0;
+    let Some(mut executable) = parts.first().copied() else {
+        return Vec::new();
+    };
+    if matches!(
+        executable,
+        "sh" | "bash" | "zsh" | "pwsh" | "powershell" | "cmd" | "cmd.exe"
+    ) {
+        let command_flag = parts
+            .iter()
+            .position(|part| matches!(*part, "-c" | "-Command" | "-command" | "/c"));
+        let command = command_flag.map_or_else(
+            || parts[1..].join(" "),
+            |command_flag| parts[command_flag + 1..].join(" "),
+        );
+        return command_targets_at(&command, depth + 1, limit_reached);
+    }
+    if matches!(executable, "cross-env" | "cross-env-shell" | "env") {
+        let Some(found) = parts
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(index, part)| (!part.contains('=')).then_some(index))
+        else {
+            return Vec::new();
+        };
+        index = found;
+        executable = parts[index];
     }
     if matches!(executable, "npx" | "pnpm" | "yarn") {
-        executable = parts.next()?;
+        index += 1;
+        let Some(next) = parts.get(index).copied() else {
+            return Vec::new();
+        };
+        executable = next;
         if executable == "exec" {
-            executable = parts.next()?;
+            index += 1;
+            let Some(next) = parts.get(index).copied() else {
+                return Vec::new();
+            };
+            executable = next;
         }
     }
     if !matches!(
         executable,
         "node" | "node.exe" | "bun" | "deno" | "tsx" | "ts-node"
     ) {
-        return None;
+        if matches!(
+            executable,
+            "sh" | "bash" | "zsh" | "pwsh" | "powershell" | "cmd" | "cmd.exe"
+        ) {
+            return command_target(&parts[index..].join(" "), depth, limit_reached);
+        }
+        return Vec::new();
     }
-    parts
-        .map(|part| part.trim_matches(['"', '\'', ';']))
-        .find(|part| {
-            !part.starts_with('-')
+    let args = &parts[index + 1..];
+    let mut skip_value = false;
+    let mut targets = Vec::new();
+    for argument in args {
+        if skip_value {
+            skip_value = false;
+            if !argument.starts_with('-')
                 && [".js", ".cjs", ".mjs", ".ts", ".cts", ".mts", ".jsx", ".tsx"]
                     .iter()
-                    .any(|suffix| part.ends_with(suffix))
-        })
-        .map(str::to_owned)
+                    .any(|suffix| argument.ends_with(suffix))
+            {
+                targets.push((*argument).to_owned());
+            }
+            continue;
+        }
+        if matches!(*argument, "-e" | "--eval" | "-p" | "--print") {
+            return targets;
+        }
+        if matches!(*argument, "-r" | "--require" | "--import" | "--loader") {
+            skip_value = true;
+            continue;
+        }
+        if !argument.starts_with('-')
+            && [".js", ".cjs", ".mjs", ".ts", ".cts", ".mts", ".jsx", ".tsx"]
+                .iter()
+                .any(|suffix| argument.ends_with(suffix))
+        {
+            targets.push((*argument).to_owned());
+        }
+    }
+    targets
 }
 
 fn find_line(text: &str, needle: &str) -> Option<u64> {
@@ -445,4 +644,49 @@ pub(super) fn resolve_import<'a>(
             .get_key_value(candidate.as_str())
             .map(|(path, _)| *path)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_COMMAND_DEPTH, MAX_ROOTS_PER_FILE, roots};
+
+    #[test]
+    fn caps_roots_from_hostile_package_metadata() {
+        let scripts = (0..=MAX_ROOTS_PER_FILE)
+            .map(|index| format!("\"script{index}\":\"node {index}.js\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let text = format!("{{\"scripts\":{{{scripts}}}}}");
+
+        let result = roots("package.json", Some(&text), &[]);
+
+        assert_eq!(result.roots.len(), MAX_ROOTS_PER_FILE);
+        assert!(result.incomplete);
+    }
+
+    #[test]
+    fn caps_recursive_shell_wrappers_from_hostile_package_metadata() {
+        let command = (0..MAX_COMMAND_DEPTH).fold("node main.js".to_owned(), |command, _| {
+            format!("sh -c {command}")
+        });
+        let text = format!(r#"{{"scripts":{{"start":"{command}"}}}}"#);
+
+        let result = roots("package.json", Some(&text), &[]);
+
+        assert!(result.incomplete);
+    }
+
+    #[test]
+    fn includes_node_preload_and_entry_files_as_roots() {
+        let text = r#"{"scripts":{"start":"node --require ./preload.js ./main.js"}}"#;
+
+        let result = roots("package.json", Some(text), &[]);
+        let files = result
+            .roots
+            .into_iter()
+            .map(|root| root.file)
+            .collect::<Vec<_>>();
+
+        assert_eq!(files, ["main.js", "preload.js"]);
+    }
 }

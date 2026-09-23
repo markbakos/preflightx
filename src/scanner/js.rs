@@ -26,13 +26,49 @@ pub fn analyze(path: &str, text: Option<&str>) -> JsAnalysis {
         Some("js" | "cjs" | "mjs" | "jsx" | "ts" | "cts" | "mts" | "tsx")
     );
     let suspicious = text.is_some_and(|text| {
-        super::classifier::looks_like_executable_text(text)
-            || (matches!(
-                extension,
-                Some("svg" | "woff" | "woff2" | "png" | "jpg" | "gif")
-            ) && ["eval(", "require(", "module.exports", "const ", "function "]
-                .iter()
-                .any(|prefix| text.trim_start().starts_with(prefix)))
+        let shell_shebang = text
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("#!"))
+            .is_some_and(|interpreter| !interpreter.to_ascii_lowercase().contains("node"));
+        let source_start = text.trim_start();
+        // ponytail: only parse source-led text; extracting embedded HTML/Vue/Markdown scripts needs format-aware boundaries.
+        let source_led = [
+            "#!",
+            "//",
+            "/*",
+            "const ",
+            "let ",
+            "var ",
+            "function ",
+            "async ",
+            "class ",
+            "import ",
+            "export ",
+            "module.",
+            "exports.",
+            "require(",
+            "eval(",
+            "new Function",
+            "global",
+            "process.",
+            "fetch(",
+            "setTimeout(",
+            "(",
+            "\"use strict\"",
+            "'use strict'",
+        ]
+        .iter()
+        .any(|prefix| source_start.starts_with(prefix));
+        !shell_shebang
+            && source_led
+            && (super::classifier::looks_like_executable_text(text)
+                || (matches!(
+                    extension,
+                    Some("svg" | "woff" | "woff2" | "png" | "jpg" | "gif")
+                ) && ["eval(", "require(", "module.exports", "const ", "function "]
+                    .iter()
+                    .any(|prefix| text.trim_start().starts_with(prefix))))
     });
     let mut result = JsAnalysis {
         language: None,
@@ -146,6 +182,43 @@ mod tests {
         assert_eq!(minimal.language.as_deref(), Some("javascript"));
         let negative = analyze("real.svg", Some("<svg><text>const x = 1</text></svg>"));
         assert!(negative.findings.is_empty());
+    }
+
+    #[test]
+    fn shell_shebang_is_not_sent_to_the_javascript_parser() {
+        let analysis = analyze(
+            ".git/hooks/push-to-checkout.sample",
+            Some("#!/bin/sh\nfunction die() { echo failed; }\n"),
+        );
+        assert!(analysis.incomplete_reasons.is_empty());
+        assert!(analysis.module.is_none());
+    }
+
+    #[test]
+    fn embedded_document_examples_are_not_whole_file_javascript() {
+        for (path, text) in [
+            (
+                "README.md",
+                "# Examples\nconst value = 1; function run() {}",
+            ),
+            (
+                "index.html",
+                "<!doctype html><script>const value = 1;</script>",
+            ),
+            (
+                "index.notjs",
+                "<notjs>\nimport { value } from './value.js';\n</notjs>",
+            ),
+            ("App.vue", "<script>const value = 1;</script><template />"),
+            ("config.yml", "name: example\nrun: node script.js"),
+        ] {
+            let analysis = analyze(path, Some(text));
+            assert!(analysis.incomplete_reasons.is_empty(), "{path}");
+            assert!(analysis.module.is_none(), "{path}");
+        }
+
+        let disguised = analyze("payload.md", Some("const payload = 1; function run() {}"));
+        assert_eq!(disguised.language.as_deref(), Some("javascript"));
     }
 
     #[test]

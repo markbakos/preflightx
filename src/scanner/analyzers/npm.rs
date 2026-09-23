@@ -20,6 +20,8 @@ fn analyze_manifest(path: &str, text: &str) -> MetadataAnalysis {
     };
     let mut analysis = MetadataAnalysis::default();
     if let Some(scripts) = value.get("scripts").and_then(Value::as_object) {
+        // ponytail: omit source lines for large manifests to avoid quadratic scans; use a token-position parser if they need exact locations.
+        let line_evidence = scripts.len() <= 64;
         for (name, command) in scripts {
             let Some(command) = command.as_str() else {
                 continue;
@@ -59,7 +61,9 @@ fn analyze_manifest(path: &str, text: &str) -> MetadataAnalysis {
                     "The npm script '{name}' can execute repository-controlled commands."
                 ),
                 file: Some(path.to_owned()),
-                line: find_line(text, &format!("\"{name}\"")),
+                line: line_evidence
+                    .then(|| find_line(text, &format!("\"{name}\"")))
+                    .flatten(),
                 evidence: vec![format!("{name}: {}", bounded(command))],
             });
         }
