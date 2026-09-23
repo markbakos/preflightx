@@ -1,7 +1,8 @@
 use oxc_ast::ast::{
-    Argument, ArrowFunctionExpression, CallExpression, ComputedMemberExpression, Expression,
-    Function, ImportDeclaration, ImportDeclarationSpecifier, ImportExpression, NewExpression,
-    Program, StaticMemberExpression, VariableDeclarator,
+    Argument, ArrowFunctionExpression, CallExpression, ComputedMemberExpression,
+    ExportAllDeclaration, ExportFromDeclaration, Expression, Function, ImportDeclaration,
+    ImportDeclarationSpecifier, ImportExpression, NewExpression, Program, StaticMemberExpression,
+    VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_semantic::{ScopeFlags, Scoping, SemanticBuilder, SymbolId};
@@ -193,6 +194,16 @@ impl Collector<'_> {
 }
 
 impl<'a> Visit<'a> for Collector<'_> {
+    fn visit_export_from_declaration(&mut self, export: &ExportFromDeclaration<'a>) {
+        self.push_import(export.source.value.as_str(), export.span);
+        walk::walk_export_from_declaration(self, export);
+    }
+
+    fn visit_export_all_declaration(&mut self, export: &ExportAllDeclaration<'a>) {
+        self.push_import(export.source.value.as_str(), export.span);
+        walk::walk_export_all_declaration(self, export);
+    }
+
     fn visit_import_declaration(&mut self, import: &ImportDeclaration<'a>) {
         let specifier = import.source.value.as_str();
         self.push_import(specifier, import.span);

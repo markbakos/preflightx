@@ -2,14 +2,17 @@ use super::{ModuleFacts, semantic::static_string};
 use crate::model::{Confidence, Finding, Severity};
 use crate::scanner::graph::resolve_import;
 use oxc_ast::ast::{
-    Argument, BindingPattern, Declaration, Expression, ImportDeclarationSpecifier,
-    ObjectPropertyKind, Program, PropertyKey, Statement,
+    Argument, AssignmentTarget, BindingPattern, Declaration, ExportDefaultDeclarationKind,
+    Expression, ImportDeclarationSpecifier, ModuleExportName, ObjectPropertyKind, Program,
+    PropertyKey, Statement,
 };
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct ModuleFlow {
     pub imports: BTreeMap<String, (String, String)>,
+    pub exports: BTreeMap<String, String>,
+    pub reexports: BTreeMap<String, (String, String)>,
     pub functions: BTreeMap<String, Function>,
     pub body: Vec<Stmt>,
 }
@@ -365,6 +368,36 @@ impl Lower<'_> {
             Statement::ExportDeclaration(export) => {
                 self.declaration(&export.declaration, functions)
             }
+            Statement::ExportDefaultDeclaration(export) => {
+                match &export.declaration {
+                    ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
+                        let params = function
+                            .params
+                            .items
+                            .iter()
+                            .map(|item| self.binding(&item.pattern))
+                            .collect();
+                        let body = function
+                            .body
+                            .as_ref()
+                            .map(|body| self.statements(&body.statements, functions))
+                            .unwrap_or_default();
+                        functions.insert("default".to_owned(), Function { params, body });
+                    }
+                    ExportDefaultDeclarationKind::ArrowFunctionExpression(arrow) => {
+                        let (parameter, body) = self.callback(arrow);
+                        functions.insert(
+                            "default".to_owned(),
+                            Function {
+                                params: vec![parameter],
+                                body,
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+                Vec::new()
+            }
             Statement::ExpressionStatement(expression) => {
                 vec![Stmt::Expr(self.expr(&expression.expression))]
             }
@@ -434,7 +467,64 @@ fn argument_text<'a>(argument: &'a Argument<'_>) -> Option<&'a str> {
 pub fn lower(program: &Program<'_>, source: &str) -> ModuleFlow {
     let lower = Lower { source };
     let mut imports = BTreeMap::new();
+    let mut exports = BTreeMap::new();
+    let mut reexports = BTreeMap::new();
     for statement in &program.body {
+        if let Statement::ExportDeclaration(export) = statement {
+            match &export.declaration {
+                Declaration::FunctionDeclaration(function) => {
+                    if let Some(id) = &function.id {
+                        exports.insert(id.name.to_string(), id.name.to_string());
+                    }
+                }
+                Declaration::VariableDeclaration(variable) => {
+                    for item in &variable.declarations {
+                        if let BindingPattern::BindingIdentifier(binding) = &item.id {
+                            exports.insert(binding.name.to_string(), binding.name.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if let Statement::ExportNamedDeclaration(export) = statement {
+            for specifier in &export.specifiers {
+                if let (Some(local), Some(exported)) = (
+                    module_export_name(&specifier.local),
+                    module_export_name(&specifier.exported),
+                ) {
+                    exports.insert(exported.to_owned(), local.to_owned());
+                }
+            }
+        } else if let Statement::ExportDefaultDeclaration(_) = statement {
+            exports.insert("default".to_owned(), "default".to_owned());
+        } else if let Statement::ExportFromDeclaration(export) = statement {
+            for specifier in &export.specifiers {
+                if let (Some(local), Some(exported)) = (
+                    module_export_name(&specifier.local),
+                    module_export_name(&specifier.exported),
+                ) {
+                    reexports.insert(
+                        exported.to_owned(),
+                        (export.source.value.to_string(), local.to_owned()),
+                    );
+                }
+            }
+        } else if let Statement::ExpressionStatement(statement) = statement
+            && let Expression::AssignmentExpression(assignment) = &statement.expression
+            && let AssignmentTarget::StaticMemberExpression(target) = &assignment.left
+            && matches!(&target.object, Expression::Identifier(id) if id.name == "module")
+            && target.property.name == "exports"
+            && let Expression::ObjectExpression(object) = &assignment.right
+        {
+            for property in &object.properties {
+                if let ObjectPropertyKind::ObjectProperty(property) = property
+                    && let (Some(exported), Expression::Identifier(local)) =
+                        (lower.key(&property.key), &property.value)
+                {
+                    exports.insert(exported, local.name.to_string());
+                }
+            }
+        }
         if let Statement::ImportDeclaration(import) = statement {
             let specifier = import.source.value.to_string();
             if let Some(bindings) = &import.specifiers {
@@ -478,8 +568,18 @@ pub fn lower(program: &Program<'_>, source: &str) -> ModuleFlow {
     let body = lower.statements(&program.body, &mut functions);
     ModuleFlow {
         imports,
+        exports,
+        reexports,
         functions,
         body,
+    }
+}
+
+fn module_export_name<'a>(name: &'a ModuleExportName<'_>) -> Option<&'a str> {
+    match name {
+        ModuleExportName::IdentifierName(value) => Some(value.name.as_str()),
+        ModuleExportName::IdentifierReference(value) => Some(value.name.as_str()),
+        ModuleExportName::StringLiteral(value) => Some(value.value.as_str()),
     }
 }
 
@@ -933,15 +1033,11 @@ impl Evaluator<'_> {
                 && let Some((specifier, exported)) = import.rsplit_once('#')
                 && specifier.starts_with('.')
                 && let Some(target) = resolve_import(path, specifier, &self.modules)
-                && let Some(function) = self.modules[target]
-                    .flow
-                    .functions
-                    .get(exported.strip_prefix("*.").unwrap_or(exported))
-                    .cloned()
+                && let Some((target, local, function)) =
+                    self.exported_function(target, exported.strip_prefix("*.").unwrap_or(exported))
             {
-                let target = target.to_owned();
                 let scope = self.imports(self.modules[target.as_str()]);
-                return self.call_function(&target, exported, &function, args, scope, depth + 1);
+                return self.call_function(&target, &local, &function, args, scope, depth + 1);
             }
         }
         let name = name
@@ -1216,6 +1312,28 @@ impl Evaluator<'_> {
         self.run(path, &function.body, &mut scope, depth)
             .unwrap_or_default()
             .propagate(format!("return: {path} {name}"))
+    }
+
+    fn exported_function(
+        &mut self,
+        path: &str,
+        exported: &str,
+    ) -> Option<(String, String, Function)> {
+        let mut path = path.to_owned();
+        let mut exported = exported.to_owned();
+        for _ in 0..MAX_CALL_DEPTH {
+            let module = self.modules.get(path.as_str())?;
+            if let Some(local) = module.flow.exports.get(&exported)
+                && let Some(function) = module.flow.functions.get(local)
+            {
+                return Some((path, local.clone(), function.clone()));
+            }
+            let (specifier, imported) = module.flow.reexports.get(&exported)?;
+            path = resolve_import(&path, specifier, &self.modules)?.to_owned();
+            exported = imported.clone();
+        }
+        self.limited = true;
+        None
     }
 
     fn exfiltration(&mut self, path: &str, line: u64, sink: &str, args: &[Value]) {
