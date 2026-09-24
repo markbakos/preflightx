@@ -41,6 +41,14 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
                         return ExitCode::from(2);
                     }
                 },
+                cli::Format::Markdown => print!("{}", report::markdown(&report)),
+                cli::Format::Sarif => match report::sarif(&report) {
+                    Ok(output) => print!("{output}"),
+                    Err(error) => {
+                        eprintln!("failed to serialize SARIF report: {error}");
+                        return ExitCode::from(2);
+                    }
+                },
             }
             if report.status == model::ScanStatus::Incomplete {
                 ExitCode::from(2)

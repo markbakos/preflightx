@@ -5,8 +5,8 @@ pub const HELP: &str = "\
 Pre-execution security scanner for untrusted source repositories
 
 Usage:
-  preflightx <path> [--format terminal|json] [--fail-on <severity>]
-  preflightx scan <path> [--format terminal|json] [--fail-on <severity>]
+  preflightx <path> [--format terminal|json|markdown|sarif] [--fail-on <severity>]
+  preflightx scan <path> [--format terminal|json|markdown|sarif] [--fail-on <severity>]
   preflightx rules
   preflightx rules show <rule-id>
   preflightx explain <finding-id>
@@ -20,6 +20,8 @@ pub enum Format {
     #[default]
     Terminal,
     Json,
+    Markdown,
+    Sarif,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -109,6 +111,8 @@ fn parse_format(value: OsString) -> Result<Format, String> {
     match value.to_str() {
         Some("terminal") => Ok(Format::Terminal),
         Some("json") => Ok(Format::Json),
+        Some("markdown") => Ok(Format::Markdown),
+        Some("sarif") => Ok(Format::Sarif),
         Some(value) => Err(format!("unsupported format: {value}")),
         None => Err("format must be valid UTF-8".to_owned()),
     }
@@ -172,5 +176,19 @@ mod tests {
             parse(args(&["repo", "--online"])),
             Err("unknown option: --online".to_owned())
         );
+    }
+
+    #[test]
+    fn accepts_markdown_and_sarif_output_formats() {
+        for (value, format) in [("markdown", Format::Markdown), ("sarif", Format::Sarif)] {
+            assert_eq!(
+                parse(args(&["repo", "--format", value])),
+                Ok(Command::Scan(ScanArgs {
+                    path: PathBuf::from("repo"),
+                    format,
+                    fail_on: Severity::High,
+                }))
+            );
+        }
     }
 }
