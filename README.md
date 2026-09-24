@@ -2,7 +2,7 @@
 
 A local-first, static security scanner for inspecting untrusted source repositories before executing them.
 
-> Development status: Stage 3 local acceptance is complete; Stage 4 hardening is underway. The Linux CLI applies Landlock and seccomp to scans and Git diffs where supported. Unsupported or unavailable sandbox backends fail closed unless the user explicitly passes `--no-sandbox`. Deterministic mutation smoke tests do not replace coverage-guided fuzzing; broad corpus calibration, macOS/Windows sandbox backends, observed cross-platform runtime results, and release supply-chain gates remain open.
+> Development status: Stage 3 local acceptance is complete; Stage 4 hardening is underway. Hosted CI passes on Ubuntu, macOS, and Windows, including lint (verified at `ddff2ca`). The Linux CLI applies Landlock and seccomp to scans and Git diffs where supported. Unsupported or unavailable sandbox backends fail closed unless the user explicitly passes `--no-sandbox`. Deterministic mutation smoke tests do not replace coverage-guided fuzzing; broad corpus calibration, macOS/Windows sandbox backends, Linux AArch64 runtime proof, packet-capture evidence, and release supply-chain gates remain open.
 
 PreflightX is designed to remain offline by default, treat every target file as hostile, never execute target code, and never modify the repository being inspected.
 
