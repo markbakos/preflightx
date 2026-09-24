@@ -4,13 +4,13 @@ This runbook describes the work required to publish PreflightX through GitHub Re
 
 ## Current status
 
-As of 2026-09-24:
+As of 2026-09-25:
 
 - The public GitHub repository is the upstream source. The latest verified CI run is green for lint and the Ubuntu, macOS, and Windows test jobs at [`ddff2ca`](https://github.com/markbakos/preflightx/actions/runs/36053219549).
-- The project is now licensed under MIT in `LICENSE` and Cargo metadata. The copyright line currently names the PreflightX contributors collectively.
+- The project is licensed under MIT in `LICENSE` and Cargo metadata. The copyright notice and public publisher/maintainer identity use the GitHub handle `markbakos`, at the user's direction. This notice assumes the user owns the project's original code rights.
 - There is no release tag, published GitHub release, Arch `PKGBUILD`/`.SRCINFO`, Homebrew tap/formula, or WinGet manifest. `publish = false` only disables crates.io publication; it does not block these channels.
 - A draft-only release workflow now exists. It has not run yet and stays disabled until a repository administrator sets `PREFLIGHTX_RELEASE_ENABLED=true` after configuring the release environment and tag protections. When enabled, it waits for lint and all three OS test jobs, builds a Linux x86_64 archive, creates an SPDX SBOM and checksums, verifies the tag signature, attests the archive/SBOM, and opens a GitHub draft release.
-- Publisher identity, release/tag signing key ownership, account setup, and external repository protections remain unresolved.
+- Release/tag signing key ownership, account setup, and external repository protections remain unresolved. No separate company or organization publisher is configured.
 - The current OS sandbox is Linux-only. macOS and Windows scans fail closed unless the user explicitly opts out with `--no-sandbox`. CI passing on those systems does not add native sandbox protection.
 
 So, **the release automation is prepared but not validated by a tagged run, and no store listing is ready to publish**. Linux x86_64 AUR remains the proposed first package after the gates below are addressed.
@@ -33,8 +33,8 @@ For this command-line product, a Homebrew tap is the intended macOS channel; the
 
 ### Product and publisher decisions
 
-- [x] MIT is selected and present in `LICENSE` and Cargo package metadata. Confirm the desired named copyright holder before the first public release if the collective notice should be more specific.
-- [ ] Choose the publisher/display name and maintainer contact that will appear in package metadata. WinGet also needs a stable `Publisher.Package` identifier.
+- [x] MIT is selected and present in `LICENSE` and Cargo package metadata; the public copyright attribution is `markbakos`.
+- [x] Use the personal GitHub identity `markbakos` as publisher and maintainer. Proposed Homebrew install name: `brew install markbakos/tap/preflightx`; proposed WinGet identifier: `markbakos.PreflightX`. Check availability and follow each store's review process before publishing.
 - [ ] Choose the first release version and supported target list. The prepared workflow currently limits artifacts to Linux x86_64; Arch's AUR rules require x86_64 support.
 - [ ] Choose who owns and protects release signing keys, how the public verification keys are distributed, and how keys are revoked or rotated.
 - [ ] Choose whether publishing starts with AUR only or waits for macOS/Windows sandbox backends. Do not imply that macOS or Windows scans are OS-sandboxed while their current CLI path requires `--no-sandbox`.
@@ -115,11 +115,11 @@ The intended install command is:
 yay -S preflightx-bin
 ```
 
-### Homebrew tap: `brew install <publisher>/tap/preflightx`
+### Homebrew tap: `brew install markbakos/tap/preflightx`
 
 Homebrew taps are Git repositories containing formulas. A formula can install the versioned upstream archive and its checksum; see [How to Create and Maintain a Tap](https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap) and the [Formula Cookbook](https://docs.brew.sh/Formula-Cookbook).
 
-- [ ] Choose the publisher/tap name and create a public repository named `homebrew-tap` (or the corresponding publisher-owned tap repository).
+- [ ] Create a public `markbakos/homebrew-tap` repository under the GitHub account, then add the formula after a versioned macOS artifact and checksum exist.
 - [ ] Add a `preflightx` formula with immutable release URLs, SHA-256 values, executable installation into `bin`, and a small `test do` smoke test.
 - [ ] Tell users that this is a third-party tap and that they should trust the tap/formula before installing it.
 - [ ] Build and verify macOS x86_64 and Apple silicon artifacts if both are advertised.
@@ -127,11 +127,11 @@ Homebrew taps are Git repositories containing formulas. A formula can install th
 - [ ] Test installation, `preflightx --version`, `doctor`, and a benign synthetic scan on clean Intel and Apple silicon Macs before updating the tap.
 - [ ] For every release, update the formula version, immutable URLs, and checksums; commit and push the tap update.
 
-### WinGet: `winget install <Publisher.Package>`
+### WinGet: `winget install markbakos.PreflightX` (proposed identifier)
 
 WinGet installs from versioned YAML manifests in Microsoft's community repository. A submission is a pull request that is automatically validated and then reviewed; see Microsoft's [manifest guide](https://learn.microsoft.com/en-us/windows/package-manager/package/manifest) and [submission guide](https://learn.microsoft.com/en-us/windows/package-manager/package/repository).
 
-- [ ] Choose a stable publisher name and package identifier. Do not invent a publisher identity in the manifest.
+- [ ] Check that `markbakos.PreflightX` is available and accepted by WinGet; use `markbakos` as the publisher display name unless Microsoft's submission process requires another verified public name.
 - [ ] Produce a Windows x64 release asset and decide whether a portable archive or a silent installer is the correct install type. Add Windows ARM64 only after its build and runtime support are validated.
 - [ ] Create the versioned manifest with the direct upstream release URL, SHA-256, architecture, license, publisher, package name, and accurate installer behavior.
 - [ ] Run `winget validate` and install/uninstall the manifest in Windows Sandbox, checking both user and administrator scenarios as applicable.
@@ -148,19 +148,6 @@ WinGet installs from versioned YAML manifests in Microsoft's community repositor
 ## Safe release testing boundary
 
 Release testing should build and install **PreflightX itself** in disposable, clean operating-system environments. The GitHub workflow downloads locked Rust build dependencies and a pinned Syft tool on GitHub-hosted runners; it does not run a package manager against scan targets. Smoke tests should scan only benign, synthetic fixtures. Do not download, install, execute, or scan real malicious packages as part of building releases, testing package recipes, validating stores, or updating manifests. The scanner's campaign regressions remain reconstructed inert text and generated bytes; they are not package artifacts.
-
-## What you will need to provide
-
-These choices and account-owned operations cannot be safely guessed or completed from this repository:
-
-1. Confirm whether the collective copyright line should name a person or organization.
-2. The publisher/display name, maintainer contact, and stable WinGet identifier.
-3. Confirm the initial channel and supported target matrix. The prepared default is Linux x86_64 first, with AUR after a real tagged artifact and release checks pass.
-4. Provide/enable a GitHub-recognized GPG or SSH tag-signing key and choose how to rotate it; GitHub attestations cover artifact provenance but do not sign the Git tag.
-5. Configure the `release` environment with required reviewers, protect `v*` tags and require code-owner review, then set the `PREFLIGHTX_RELEASE_ENABLED` repository variable to `true`.
-6. An AUR account and dedicated SSH key, Homebrew tap ownership, and any other package-repository accounts. Keep macOS/Windows listings deferred until their native sandbox backends exist, or approve a narrower, accurately disclosed policy for those platforms.
-
-No store account, release credential, signing key, tag, GitHub release, or package repository has been created by this work. The workflow builds PreflightX using its locked Rust dependencies and scans only one generated benign text fixture; it never downloads, installs, executes, or scans a real malicious package.
 
 ## Official references
 
