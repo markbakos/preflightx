@@ -33,6 +33,10 @@ Scans are offline and read-only. The scanner inspects only the repository suppli
 
 On supported Linux kernels, the CLI sandbox allows reads only beneath the requested scan root, denies filesystem writes, and blocks executable launches and network socket syscalls. It refuses writable regular-file, socket, or block-device stdout/stderr descriptors because those can bypass path-based write restrictions; pipe output or explicitly use `--no-sandbox` for file redirection. `--no-sandbox` disables this OS layer and always prints a warning; the scanner's static/offline code path remains in effect. The Rust library functions in `preflightx::scanner` do not install process isolation themselves.
 
+## Releases
+
+See the [release guide](docs/releasing.md) for current publishing readiness, remaining release gates, and the Arch AUR, Homebrew, and WinGet checklists.
+
 ## Development
 
 ```sh
