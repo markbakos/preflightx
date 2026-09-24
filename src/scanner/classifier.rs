@@ -14,7 +14,11 @@ pub fn classify(relative: &str, path: &Path, metadata: &Metadata, bytes: &[u8]) 
         .extension()
         .map(|value| value.to_string_lossy().to_ascii_lowercase());
     let detected_mime = infer::get(bytes).map(|kind| kind.mime_type().to_owned());
-    let (encoding, text) = decode_text(bytes);
+    let js_source = matches!(
+        extension.as_deref(),
+        Some("js" | "cjs" | "mjs" | "jsx" | "ts" | "cts" | "mts" | "tsx")
+    );
+    let (encoding, text) = decode_text(bytes, js_source);
     let raw = raw::analyze(relative, bytes, text.as_deref());
     let mut findings = raw.findings;
 
@@ -106,7 +110,7 @@ pub fn unscanned_record(relative: &str, path: &Path, metadata: &Metadata) -> Fil
     }
 }
 
-fn decode_text(bytes: &[u8]) -> (Option<String>, Option<String>) {
+fn decode_text(bytes: &[u8], js_source: bool) -> (Option<String>, Option<String>) {
     if let Some(bytes) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
         return match std::str::from_utf8(bytes) {
             Ok(text) => (Some("utf-8-bom".to_owned()), Some(text.to_owned())),
@@ -139,7 +143,7 @@ fn decode_text(bytes: &[u8]) -> (Option<String>, Option<String>) {
             Err(_) => (Some("unknown".to_owned()), None),
         };
     }
-    if bytes.iter().take(8_192).any(|byte| *byte == 0) {
+    if !js_source && bytes.iter().take(8_192).any(|byte| *byte == 0) {
         return (Some("binary".to_owned()), None);
     }
     match std::str::from_utf8(bytes) {
@@ -329,8 +333,15 @@ mod tests {
 
     #[test]
     fn classifies_nul_bytes_as_binary() {
-        let (encoding, text) = decode_text(b"\0\0\0\0");
+        let (encoding, text) = decode_text(b"\0\0\0\0", false);
         assert_eq!(encoding.as_deref(), Some("binary"));
         assert!(text.is_none());
+    }
+
+    #[test]
+    fn passes_nul_in_declared_javascript_to_the_parser() {
+        let (encoding, text) = decode_text(b"const id = '\0'", true);
+        assert_eq!(encoding.as_deref(), Some("utf-8"));
+        assert_eq!(text.as_deref(), Some("const id = '\0'"));
     }
 }
