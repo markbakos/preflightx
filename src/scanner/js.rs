@@ -139,12 +139,25 @@ pub fn analyze(path: &str, text: Option<&str>) -> JsAnalysis {
             .next()
             .and_then(|line| line.strip_prefix("#!"))
             .is_some_and(|interpreter| !interpreter.to_ascii_lowercase().contains("node"));
-        let source_start = text.trim_start();
+        let mut source_start = text.trim_start();
+        loop {
+            if let Some(comment) = source_start.strip_prefix("//") {
+                source_start = comment
+                    .find('\n')
+                    .map_or("", |end| &comment[end + 1..])
+                    .trim_start();
+            } else if let Some(comment) = source_start.strip_prefix("/*") {
+                source_start = comment
+                    .find("*/")
+                    .map_or("", |end| &comment[end + 2..])
+                    .trim_start();
+            } else {
+                break;
+            }
+        }
         // ponytail: only parse source-led text; extracting embedded HTML/Vue/Markdown scripts needs format-aware boundaries.
         let source_led = [
             "#!",
-            "//",
-            "/*",
             "const ",
             "let ",
             "var ",
@@ -178,7 +191,9 @@ pub fn analyze(path: &str, text: Option<&str>) -> JsAnalysis {
             "console.",
             "setTimeout(",
             "setInterval(",
-            "(",
+            "(()",
+            "(function ",
+            "(async ",
             "\"use strict\"",
             "'use strict'",
         ]
@@ -192,7 +207,7 @@ pub fn analyze(path: &str, text: Option<&str>) -> JsAnalysis {
                     Some("svg" | "woff" | "woff2" | "png" | "jpg" | "gif")
                 ) && ["eval(", "require(", "module.exports", "const ", "function "]
                     .iter()
-                    .any(|prefix| text.trim_start().starts_with(prefix))))
+                    .any(|prefix| source_start.starts_with(prefix))))
     };
     if !supported && !suspicious {
         return result;
@@ -358,6 +373,19 @@ fn extract_scripts(text: &str, markdown: bool) -> Extraction<'_> {
     let mut total_bytes = 0usize;
     let mut fence_index = 0;
     while let Some(open) = find_ascii_case_insensitive(text.as_bytes(), b"<script", cursor) {
+        if let Some(comment) = find_ascii_case_insensitive(text.as_bytes(), b"<!--", cursor)
+            && comment < open
+        {
+            let Some(end) = find_ascii_case_insensitive(text.as_bytes(), b"-->", comment + 4)
+            else {
+                extraction
+                    .incomplete
+                    .push("unterminated HTML comment before embedded script".to_owned());
+                break;
+            };
+            cursor = end + 3;
+            continue;
+        }
         cursor = open + b"<script".len();
         while excluded
             .get(fence_index)
@@ -782,6 +810,27 @@ mod tests {
         assert_eq!(minimal.language.as_deref(), Some("javascript"));
         let negative = analyze("real.svg", Some("<svg><text>const x = 1</text></svg>"));
         assert!(negative.findings.is_empty());
+
+        let commented = analyze(
+            "payload.data",
+            Some("/* ordinary banner */\n// second line\nconst cp = require('child_process');"),
+        );
+        assert_eq!(commented.language.as_deref(), Some("javascript"));
+        for (path, source) in [
+            (
+                "gating.rs",
+                "// mentions const and function\nuse crate::module;",
+            ),
+            ("module.wat", "(module (import \"const \" \"function \"))"),
+            (
+                "style.css",
+                "/* const and function */\nbody { color: red; }",
+            ),
+        ] {
+            let analysis = analyze(path, Some(source));
+            assert!(analysis.incomplete_reasons.is_empty(), "{path}");
+            assert!(analysis.modules.is_empty(), "{path}");
+        }
     }
 
     #[test]
@@ -825,6 +874,14 @@ mod tests {
         );
         assert_eq!(multiple.modules.len(), 2);
         assert_ne!(multiple.modules[0].id, multiple.modules[1].id);
+
+        let commented = analyze(
+            "comments.html",
+            Some("<!-- <script>invalid(</script> -->\n<script>const live = 1;</script>"),
+        );
+        assert!(commented.incomplete_reasons.is_empty());
+        assert_eq!(commented.modules.len(), 1);
+        assert_eq!(commented.embedded_roots[0].line, 2);
 
         for (path, text) in [
             (
