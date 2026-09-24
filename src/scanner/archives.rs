@@ -139,7 +139,11 @@ fn expand_zip(path: &str, bytes: &[u8], depth: usize, budget: &mut Budget, resul
             continue;
         }
         let mut content = Vec::with_capacity(uncompressed as usize);
-        if let Err(error) = entry.read_to_end(&mut content) {
+        if let Err(error) = entry
+            .by_ref()
+            .take(uncompressed.saturating_add(1))
+            .read_to_end(&mut content)
+        {
             result
                 .incomplete_reasons
                 .push(format!("cannot decompress {child_path}: {error}"));
@@ -226,7 +230,11 @@ fn expand_tar(path: &str, bytes: &[u8], depth: usize, budget: &mut Budget, resul
             continue;
         }
         let mut content = Vec::with_capacity(size as usize);
-        if let Err(error) = entry.read_to_end(&mut content) {
+        if let Err(error) = entry
+            .by_ref()
+            .take(size.saturating_add(1))
+            .read_to_end(&mut content)
+        {
             result
                 .incomplete_reasons
                 .push(format!("cannot read {child_path}: {error}"));
