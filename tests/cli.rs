@@ -1,10 +1,13 @@
 use serde_json::Value;
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(target_os = "linux")]
+use std::{fs::OpenOptions, process::Stdio};
 
 #[test]
 fn json_scan_completes_without_findings() {
