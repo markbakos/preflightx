@@ -58,8 +58,14 @@ pub enum Stmt {
     Bind(Binding, Expr),
     Expr(Expr),
     Return(Expr),
+    Throw(Expr),
     Branch(Expr, Vec<Stmt>, Vec<Stmt>),
     Iterate(Binding, Expr, Vec<Stmt>),
+    Try {
+        body: Vec<Stmt>,
+        catch: Option<(Binding, Vec<Stmt>)>,
+        finally: Vec<Stmt>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +85,8 @@ pub enum Expr {
     Assign(String, Box<Expr>),
     Unknown,
 }
+
+const THROWN_VALUE: &str = "\0preflightx-thrown";
 
 struct Lower<'a> {
     source: &'a str,
@@ -705,7 +713,7 @@ impl Lower<'_> {
                 .as_ref()
                 .map(|expression| vec![Stmt::Return(self.expr(expression))])
                 .unwrap_or_default(),
-            Statement::ThrowStatement(throw) => vec![Stmt::Expr(self.expr(&throw.argument))],
+            Statement::ThrowStatement(throw) => vec![Stmt::Throw(self.expr(&throw.argument))],
             Statement::LabeledStatement(labeled) => self.statement(&labeled.body, functions),
             Statement::BlockStatement(block) => self.statements(&block.body, functions),
             Statement::IfStatement(branch) => vec![Stmt::Branch(
@@ -781,18 +789,24 @@ impl Lower<'_> {
                 )]
             }
             Statement::TryStatement(try_) => {
-                let mut body = vec![Stmt::Branch(
-                    Expr::Unknown,
-                    self.statements(&try_.block.body, functions),
-                    try_.handler
+                vec![Stmt::Try {
+                    body: self.statements(&try_.block.body, functions),
+                    catch: try_.handler.as_ref().map(|handler| {
+                        (
+                            handler
+                                .param
+                                .as_ref()
+                                .map(|param| self.binding(&param.pattern))
+                                .unwrap_or(Binding::Ignore),
+                            self.statements(&handler.body.body, functions),
+                        )
+                    }),
+                    finally: try_
+                        .finalizer
                         .as_ref()
-                        .map(|handler| self.statements(&handler.body.body, functions))
+                        .map(|finalizer| self.statements(&finalizer.body, functions))
                         .unwrap_or_default(),
-                )];
-                if let Some(finalizer) = &try_.finalizer {
-                    body.extend(self.statements(&finalizer.body, functions));
-                }
-                body
+                }]
             }
             _ => Vec::new(),
         }
@@ -1217,6 +1231,9 @@ impl Evaluator<'_> {
         }
         let mut pending_return: Option<Value> = None;
         for statement in body {
+            if environment.contains_key(THROWN_VALUE) {
+                break;
+            }
             self.steps += 1;
             if self.steps > MAX_FLOW_STEPS {
                 self.limited = true;
@@ -1229,6 +1246,10 @@ impl Evaluator<'_> {
                 }
                 Stmt::Expr(expression) => {
                     self.eval(path, expression, environment, depth);
+                }
+                Stmt::Throw(expression) => {
+                    let value = self.eval(path, expression, environment, depth);
+                    environment.insert(THROWN_VALUE.to_owned(), value);
                 }
                 Stmt::Return(expression) => {
                     let value = self.eval(path, expression, environment, depth);
@@ -1280,9 +1301,90 @@ impl Evaluator<'_> {
                         environment.entry(name).or_default().merge(value);
                     }
                 }
+                Stmt::Try {
+                    body,
+                    catch,
+                    finally,
+                } => {
+                    // ponytail: explicit throws only; implicit JS exceptions need full completion records.
+                    let mut scope = environment.clone();
+                    scope.remove(THROWN_VALUE);
+                    let mut result = self.run(path, body, &mut scope, depth + 1);
+                    let mut thrown = scope.remove(THROWN_VALUE);
+                    if let Some(value) = thrown.take() {
+                        if let Some((binding, catch_body)) = catch {
+                            let mut names = Vec::new();
+                            Self::binding_names(binding, &mut names);
+                            let previous = names
+                                .into_iter()
+                                .map(|name| {
+                                    let value = scope.get(&name).cloned();
+                                    (name, value)
+                                })
+                                .collect::<Vec<_>>();
+                            self.bind(
+                                binding,
+                                value.propagate(format!(
+                                    "exception flow: {} throw/catch",
+                                    self.file_path(path)
+                                )),
+                                &mut scope,
+                            );
+                            result = self.run(path, catch_body, &mut scope, depth + 1);
+                            for (name, value) in previous {
+                                if let Some(value) = value {
+                                    scope.insert(name, value);
+                                } else {
+                                    scope.remove(&name);
+                                }
+                            }
+                            thrown = scope.remove(THROWN_VALUE);
+                        } else {
+                            thrown = Some(value);
+                        }
+                    }
+                    let final_result = if finally.is_empty() {
+                        None
+                    } else {
+                        self.run(path, finally, &mut scope, depth + 1)
+                    };
+                    if let Some(finally_throw) = scope.remove(THROWN_VALUE) {
+                        thrown = Some(finally_throw);
+                        result = None;
+                    } else if final_result.is_some() {
+                        thrown = None;
+                    }
+                    if let Some(thrown) = thrown {
+                        scope.insert(THROWN_VALUE.to_owned(), thrown);
+                    }
+                    *environment = scope;
+                    if final_result.is_some() {
+                        return final_result;
+                    }
+                    if result.is_some() {
+                        return result;
+                    }
+                }
             }
         }
         pending_return
+    }
+
+    fn binding_names(binding: &Binding, names: &mut Vec<String>) {
+        match binding {
+            Binding::Name(name) => names.push(name.clone()),
+            Binding::Object(properties) => {
+                for (_, binding) in properties {
+                    Self::binding_names(binding, names);
+                }
+            }
+            Binding::Array(items) => {
+                for binding in items {
+                    Self::binding_names(binding, names);
+                }
+            }
+            Binding::Ignore => {}
+        }
     }
 
     fn bind(&self, binding: &Binding, value: Value, environment: &mut BTreeMap<String, Value>) {
@@ -1569,8 +1671,11 @@ impl Evaluator<'_> {
                 let value = self.eval(path, receiver, environment, depth);
                 let mut scope = environment.clone();
                 self.bind(parameter, value, &mut scope);
-                self.run(path, body, &mut scope, depth + 1)
-                    .unwrap_or_default()
+                let returned = self.run(path, body, &mut scope, depth + 1);
+                if let Some(thrown) = scope.remove(THROWN_VALUE) {
+                    environment.insert(THROWN_VALUE.to_owned(), thrown);
+                }
+                returned.unwrap_or_default()
             }
             Expr::Message(receiver, parameter, body, event) => {
                 let value = self.eval(path, receiver, environment, depth);
@@ -1614,6 +1719,9 @@ impl Evaluator<'_> {
                 }
                 self.bind(parameter, value, &mut scope);
                 let result = self.run(path, body, &mut scope, depth + 1);
+                if let Some(thrown) = scope.remove(THROWN_VALUE) {
+                    environment.insert(THROWN_VALUE.to_owned(), thrown);
+                }
                 if stream_data {
                     // Stream data callbacks run before `end`; other async callback effects stay scoped.
                     let chunks = self.stream_data.entry(stream_key).or_default();
@@ -1635,20 +1743,19 @@ impl Evaluator<'_> {
         name: &str,
         args: Vec<Value>,
         line: u64,
-        environment: &BTreeMap<String, Value>,
+        environment: &mut BTreeMap<String, Value>,
         depth: usize,
     ) -> Value {
         let module = self.modules.get(path).copied();
         if let Some(module) = module {
             if let Some(function) = module.flow.functions.get(name).cloned() {
-                return self.call_function(
-                    path,
-                    name,
-                    &function,
-                    args,
-                    environment.clone(),
-                    depth + 1,
-                );
+                let scope = environment.clone();
+                let (value, thrown) =
+                    self.call_function(path, name, &function, args, scope, depth + 1);
+                if let Some(thrown) = thrown {
+                    environment.insert(THROWN_VALUE.to_owned(), thrown);
+                }
+                return value;
             }
             if let Some(import) = name.strip_prefix("import:")
                 && let Some((specifier, exported)) = import.rsplit_once('#')
@@ -1661,7 +1768,12 @@ impl Evaluator<'_> {
                 )
             {
                 let scope = self.imports(self.modules[target.as_str()]);
-                return self.call_function(&target, &local, &function, args, scope, depth + 1);
+                let (value, thrown) =
+                    self.call_function(&target, &local, &function, args, scope, depth + 1);
+                if let Some(thrown) = thrown {
+                    environment.insert(THROWN_VALUE.to_owned(), thrown);
+                }
+                return value;
             }
         }
         let name = name
@@ -2191,7 +2303,7 @@ impl Evaluator<'_> {
         args: Vec<Value>,
         mut scope: BTreeMap<String, Value>,
         depth: usize,
-    ) -> Value {
+    ) -> (Value, Option<Value>) {
         if let Some((receiver, _)) = name.rsplit_once('.') {
             scope.insert("this".to_owned(), Value::named(receiver.to_owned()));
         }
@@ -2202,10 +2314,13 @@ impl Evaluator<'_> {
                 &mut scope,
             );
         }
-        let returned = self
-            .run(path, &function.body, &mut scope, depth)
-            .unwrap_or_default();
-        returned.propagate(format!("return: {} {name}", self.file_path(path)))
+        let returned = self.run(path, &function.body, &mut scope, depth);
+        let thrown = scope.remove(THROWN_VALUE);
+        let returned = returned.unwrap_or_default();
+        (
+            returned.propagate(format!("return: {} {name}", self.file_path(path))),
+            thrown,
+        )
     }
 
     fn exported_function(

