@@ -37,6 +37,8 @@ On supported Linux kernels, the CLI sandbox allows reads only beneath the reques
 
 See the [release guide](docs/releasing.md) for current publishing readiness, remaining release gates, and the Arch AUR, Homebrew, and WinGet checklists.
 
+PreflightX is licensed under the [MIT License](LICENSE).
+
 ## Development
 
 ```sh
