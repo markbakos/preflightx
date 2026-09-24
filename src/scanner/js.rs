@@ -273,12 +273,33 @@ fn parse_source(
     }
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
-    if parsed.fatal_error || !parsed.diagnostics.is_empty() {
+    let parsed = if (parsed.fatal_error || !parsed.diagnostics.is_empty())
+        && !parsed.is_flow_language
+        && !source_type.is_typescript()
+        && !source_type.is_jsx()
+        && source.contains('<')
+        && source.contains('>')
+    {
+        let jsx_parsed = Parser::new(&allocator, source, source_type.with_jsx(true)).parse();
+        if !jsx_parsed.fatal_error && jsx_parsed.diagnostics.is_empty() {
+            jsx_parsed
+        } else {
+            return Err(format!(
+                "JS/TS parser could not fully parse: {} diagnostic(s)",
+                parsed.diagnostics.len()
+            ));
+        }
+    } else if parsed.fatal_error || !parsed.diagnostics.is_empty() {
+        if parsed.is_flow_language {
+            return Err("Flow syntax is unsupported by the JS/TS parser".to_owned());
+        }
         return Err(format!(
             "JS/TS parser could not fully parse: {} diagnostic(s)",
             parsed.diagnostics.len()
         ));
-    }
+    } else {
+        parsed
+    };
     if parsed.program.body.is_empty() {
         return Ok(None);
     }
@@ -720,6 +741,32 @@ mod tests {
             assert_eq!(analysis.language.as_deref(), Some("typescript"), "{path}");
             assert!(analysis.incomplete_reasons.is_empty(), "{path}");
         }
+    }
+
+    #[test]
+    fn retries_suspicious_javascript_with_jsx_grammar() {
+        for (path, source) in [
+            ("component.js", "const element = <div />;"),
+            (
+                "component.txt",
+                "const element = <div />; module.exports = element;",
+            ),
+        ] {
+            let analysis = analyze(path, Some(source));
+            assert_eq!(analysis.language.as_deref(), Some("javascript"), "{path}");
+            assert!(analysis.incomplete_reasons.is_empty(), "{path}");
+            assert_eq!(analysis.modules.len(), 1, "{path}");
+        }
+    }
+
+    #[test]
+    fn reports_flow_as_unsupported_instead_of_a_generic_parse_failure() {
+        let analysis = analyze("flow.js", Some("// @flow\nconst value: string = 'x';"));
+        assert!(
+            analysis.incomplete_reasons[0].contains("Flow syntax is unsupported"),
+            "{:?}",
+            analysis.incomplete_reasons
+        );
     }
 
     #[test]
