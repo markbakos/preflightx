@@ -6,10 +6,24 @@ use std::{fmt::Write, fs::Metadata, path::Path};
 pub struct Classification {
     pub record: FileRecord,
     pub findings: Vec<Finding>,
+    pub incomplete_reasons: Vec<String>,
     pub text: Option<String>,
 }
 
 pub fn classify(relative: &str, path: &Path, metadata: &Metadata, bytes: &[u8]) -> Classification {
+    classify_inner(relative, path, Some(metadata), bytes)
+}
+
+pub fn classify_virtual(relative: &str, bytes: &[u8]) -> Classification {
+    classify_inner(relative, Path::new(relative), None, bytes)
+}
+
+fn classify_inner(
+    relative: &str,
+    path: &Path,
+    metadata: Option<&Metadata>,
+    bytes: &[u8],
+) -> Classification {
     let extension = path
         .extension()
         .map(|value| value.to_string_lossy().to_ascii_lowercase());
@@ -21,6 +35,13 @@ pub fn classify(relative: &str, path: &Path, metadata: &Metadata, bytes: &[u8]) 
     let (encoding, text) = decode_text(bytes, js_source);
     let raw = raw::analyze(relative, bytes, text.as_deref());
     let mut findings = raw.findings;
+    let mut incomplete_reasons = Vec::new();
+    match super::yara::analyze(relative, bytes) {
+        Ok(signature_findings) => findings.extend(signature_findings),
+        Err(error) => {
+            incomplete_reasons.push(format!("YARA-X analysis failed for {relative}: {error}"))
+        }
+    }
 
     if let Some(finding) = mismatch_finding(
         relative,
@@ -65,9 +86,9 @@ pub fn classify(relative: &str, path: &Path, metadata: &Metadata, bytes: &[u8]) 
         record: FileRecord {
             path: relative.to_owned(),
             kind: FileKind::File,
-            size: metadata.len(),
-            readonly: metadata.permissions().readonly(),
-            mode: walker::mode(metadata),
+            size: metadata.map_or(bytes.len() as u64, Metadata::len),
+            readonly: metadata.is_some_and(|metadata| metadata.permissions().readonly()),
+            mode: metadata.map(walker::mode).unwrap_or_default(),
             sha256: Some(sha256),
             extension,
             detected_mime,
@@ -82,6 +103,7 @@ pub fn classify(relative: &str, path: &Path, metadata: &Metadata, bytes: &[u8]) 
             parsed_language: None,
         },
         findings,
+        incomplete_reasons,
         text,
     }
 }

@@ -1,0 +1,21 @@
+{
+  "format_version": 1,
+  "version": "ossf-2026-06-24-node-slot",
+  "snapshot_date": "2026-06-24",
+  "sources": ["OpenSSF Malicious Packages"],
+  "records": [
+    {
+      "provider": "OpenSSF Malicious Packages",
+      "record_id": "MAL-2026-6191",
+      "ecosystem": "npm",
+      "name": "node-slot",
+      "versions": ["1.0.7", "1.0.8", "1.0.9"],
+      "record_modified": "2026-06-24T04:56:20Z",
+      "summary": "Malicious code in node-slot (npm)",
+      "provenance": "https://github.com/ossf/malicious-packages/blob/main/osv/malicious/npm/node-slot/MAL-2026-6191.json"
+    }
+  ],
+  "hashes": [],
+  "domains": [],
+  "urls": []
+}

@@ -61,6 +61,18 @@ pub const RULES: &[Rule] = &[
         description: "A debug launch configuration invokes a workspace task.",
     },
     Rule {
+        id: "LANG-EXECUTION-ROOT",
+        description: "A recognized build or package hook can run repository-controlled source.",
+    },
+    Rule {
+        id: "LANG-REMOTE-DATA-EXECUTION-CAPABILITY",
+        description: "One recognized language source contains remote-input and execution capabilities; runtime data flow is not proven.",
+    },
+    Rule {
+        id: "LANG-REMOTE-DOWNLOAD-EXECUTE",
+        description: "A recognized language source directly pipes or passes remote content to execution.",
+    },
+    Rule {
         id: "JS-COMBINED-ATTACK-CHAIN",
         description: "One evidenced route contains secret exfiltration and remote execution chains.",
     },
@@ -123,6 +135,22 @@ pub const RULES: &[Rule] = &[
     Rule {
         id: "RAW-HIDDEN-AFTER-WHITESPACE",
         description: "Content follows a large horizontal whitespace run.",
+    },
+    Rule {
+        id: "THREAT-KNOWN-MALICIOUS-HASH",
+        description: "A file SHA-256 matches a locally embedded malicious-artifact record.",
+    },
+    Rule {
+        id: "THREAT-KNOWN-MALICIOUS-PACKAGE",
+        description: "An exact resolved dependency version matches a locally embedded malicious-package record.",
+    },
+    Rule {
+        id: "YARA-POWERSHELL-DOWNLOAD-EXEC",
+        description: "A YARA-X signature matched a PowerShell download, decode, and execution pattern.",
+    },
+    Rule {
+        id: "YARA-JS-ENCRYPTED-LOADER",
+        description: "A YARA-X signature matched an AES-decrypted dynamic JavaScript loader pattern.",
     },
 ];
 

@@ -11,6 +11,10 @@ pub fn terminal(report: &ScanReport) -> String {
         &mut output,
         &format!("Scanning: {}", sanitize(&report.target)),
     );
+    push_line(
+        &mut output,
+        &format!("Profile: {}", sanitize(&report.profile)),
+    );
     output.push('\n');
     push_line(
         &mut output,
@@ -92,9 +96,10 @@ pub fn json(report: &ScanReport) -> Result<String, serde_json::Error> {
 
 pub fn markdown(report: &ScanReport) -> String {
     let mut output = format!(
-        "# PreflightX {}\n\n- **Target:** `{}`\n- **Status:** {}\n- **Files:** {}\n- **Dependencies:** {}\n- **Risk:** {} ({}/100)\n- **Network:** {}\n\n",
+        "# PreflightX {}\n\n- **Target:** `{}`\n- **Profile:** {}\n- **Status:** {}\n- **Files:** {}\n- **Dependencies:** {}\n- **Risk:** {} ({}/100)\n- **Network:** {}\n\n",
         markdown_escape(&report.scanner_version),
         markdown_escape(&report.target),
+        markdown_escape(&report.profile),
         status_label(report.status),
         report.summary.files,
         report.summary.dependencies,
@@ -226,7 +231,8 @@ pub fn sarif(report: &ScanReport) -> Result<String, serde_json::Error> {
             "results": results,
             "properties": {
                 "scanStatus": format!("{:?}", report.status).to_ascii_lowercase(),
-                "networkAccess": report.network_access
+                "networkAccess": report.network_access,
+                "scanProfile": report.profile
             }
         }]
     });
@@ -383,6 +389,7 @@ mod tests {
             scanner: "preflightx".to_owned(),
             scanner_version: "0.1.0".to_owned(),
             target: "fixture".to_owned(),
+            profile: "default".to_owned(),
             status: ScanStatus::Complete,
             network_access: "disabled".to_owned(),
             risk: Risk {

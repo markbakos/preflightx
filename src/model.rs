@@ -127,6 +127,7 @@ pub struct ScanReport {
     pub scanner: String,
     pub scanner_version: String,
     pub target: String,
+    pub profile: String,
     pub status: ScanStatus,
     pub network_access: String,
     pub risk: Risk,

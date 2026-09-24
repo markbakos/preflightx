@@ -76,7 +76,9 @@ pub fn roots(path: &str, text: Option<&str>, roles: &[String]) -> RootAnalysis {
     {
         // ponytail: keep exact line lookup for small manifests; use a token-position parser if large manifests need line evidence.
         let line_evidence = scripts.len() <= 64;
-        for (name, command) in scripts {
+        let mut ordered_scripts = scripts.iter().collect::<Vec<_>>();
+        ordered_scripts.sort_by_key(|(name, _)| name.as_str() != "start");
+        for (name, command) in ordered_scripts {
             if let Some(command) = command.as_str() {
                 let trigger = format!("npm {name} ({path})");
                 let line = line_evidence
@@ -494,7 +496,8 @@ pub fn build(modules: &[ModuleFacts], roots: &[Root], files: &[FileRecord]) -> G
                 ),
                 format!("entry: {}", module.path),
             ];
-            if reachable.insert(&module.id, route.clone()).is_none() {
+            if !reachable.contains_key(module.id.as_str()) {
+                reachable.insert(&module.id, route.clone());
                 queue.push_back((module.id.as_str(), route));
             }
         } else {
