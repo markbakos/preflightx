@@ -13,9 +13,9 @@ rule PF_Aes_Encrypted_Function_Loader {
     meta:
         family = "generic-loader"
     strings:
-        $decrypt = "createDecipheriv"
-        $cipher = "aes-256-cbc"
-        $execute = "new Function"
+        $decrypt = "createDecipheriv" nocase
+        $cipher = "aes-256-cbc" nocase
+        $execute = /new\s+Function/ nocase
     condition:
         all of them
 }

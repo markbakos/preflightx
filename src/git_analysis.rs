@@ -489,8 +489,9 @@ fn validate_admin_directory(root: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{open_repository, parse_range};
+    use super::{diff, history, open_repository, parse_range};
     use std::{
+        collections::BTreeMap,
         fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
@@ -549,6 +550,110 @@ mod tests {
                 .contains("include directives")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn history_and_diff_read_local_objects_without_hooks_or_target_writes() {
+        let root = temporary_directory("git-history");
+        let repo = gix::init(&root).unwrap();
+        let first_tree = tree_with_file(&repo, "setup.py", b"print('ordinary setup')\n");
+        let first = commit(&repo, first_tree, "base", std::iter::empty());
+        let second_tree = tree_with_file(&repo, "setup.py", b"requests.get(url)\nexec(payload)\n");
+        commit(&repo, second_tree, "introduced capability", [first]);
+
+        let hook_marker = root.join("hook-fired");
+        let hook = repo.git_dir().join("hooks/post-checkout");
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\nprintf hook-ran > '{}'\n", hook_marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let before = snapshot(&root);
+        let historic = history(&root, false).unwrap();
+        let changes = diff(&root, &format!("{}..HEAD", first)).unwrap();
+
+        assert!(historic.incomplete_reasons.is_empty());
+        assert!(historic.findings.iter().any(|finding| {
+            finding.id == "LANG-REMOTE-DATA-EXECUTION-CAPABILITY"
+                && finding.evidence.iter().any(|item| item.contains("commit:"))
+        }));
+        assert!(
+            changes
+                .output
+                .contains("LANG-REMOTE-DATA-EXECUTION-CAPABILITY")
+        );
+        assert!(!changes.incomplete);
+        assert!(
+            !hook_marker.exists(),
+            "Git hook was executed by history analysis"
+        );
+        assert_eq!(
+            snapshot(&root),
+            before,
+            "history analysis wrote into the repository"
+        );
+
+        drop(repo);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn tree_with_file(repo: &gix::Repository, path: &str, bytes: &[u8]) -> gix::ObjectId {
+        let blob = repo.write_blob(bytes).unwrap().detach();
+        let tree = gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryMode::from_bytes(b"100644").unwrap(),
+                filename: path.into(),
+                oid: blob,
+            }],
+        };
+        repo.write_object(tree).unwrap().detach()
+    }
+
+    fn commit(
+        repo: &gix::Repository,
+        tree: gix::ObjectId,
+        message: &str,
+        parents: impl IntoIterator<Item = gix::ObjectId>,
+    ) -> gix::ObjectId {
+        let signature = gix::actor::SignatureRef::from_bytes(
+            b"PreflightX Test <test@example.invalid> 1727200000 +0000",
+        )
+        .unwrap();
+        repo.commit_as(signature, signature, "HEAD", message, tree, parents)
+            .unwrap()
+            .detach()
+    }
+
+    fn snapshot(root: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
+        let mut snapshot = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                assert!(!metadata.file_type().is_symlink());
+                if metadata.is_dir() {
+                    pending.push(path);
+                } else {
+                    assert!(metadata.is_file());
+                    let relative = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    snapshot.insert(relative, fs::read(path).unwrap());
+                }
+            }
+        }
+        snapshot
     }
 
     fn temporary_directory(label: &str) -> PathBuf {

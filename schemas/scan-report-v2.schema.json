@@ -1,0 +1,94 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PreflightX Scan Report v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "scanner", "scanner_version", "target", "profile", "status",
+    "network_access", "risk", "summary", "files", "findings", "unresolved_edges",
+    "incomplete_reasons"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "scanner": { "const": "preflightx" },
+    "scanner_version": { "type": "string", "minLength": 1 },
+    "target": { "type": "string" },
+    "profile": { "enum": ["quick", "default", "deep"] },
+    "status": { "enum": ["complete", "incomplete"] },
+    "network_access": { "const": "disabled" },
+    "risk": { "$ref": "#/definitions/risk" },
+    "summary": { "$ref": "#/definitions/summary" },
+    "files": { "type": "array", "items": { "$ref": "#/definitions/file" } },
+    "findings": { "type": "array", "items": { "$ref": "#/definitions/finding" } },
+    "unresolved_edges": { "type": "array", "items": { "type": "string" } },
+    "incomplete_reasons": { "type": "array", "items": { "type": "string" } }
+  },
+  "definitions": {
+    "severity": {
+      "enum": ["informational", "low", "medium", "high", "critical"]
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["severity", "score"],
+      "properties": {
+        "severity": { "$ref": "#/definitions/severity" },
+        "score": { "type": "integer", "minimum": 0, "maximum": 100 }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entries", "files", "directories", "symlinks", "special_files", "content_bytes", "findings"],
+      "properties": {
+        "entries": { "type": "integer", "minimum": 0 },
+        "files": { "type": "integer", "minimum": 0 },
+        "directories": { "type": "integer", "minimum": 0 },
+        "symlinks": { "type": "integer", "minimum": 0 },
+        "special_files": { "type": "integer", "minimum": 0 },
+        "content_bytes": { "type": "integer", "minimum": 0 },
+        "findings": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "kind", "size", "readonly", "mode", "sha256", "extension", "detected_mime", "encoding", "entropy", "line_count", "max_line_length", "symlink_target", "roles", "raw_signals", "content_scanned", "parsed_language"],
+      "properties": {
+        "path": { "type": "string" },
+        "kind": { "enum": ["file", "directory", "symlink", "special"] },
+        "size": { "type": "integer", "minimum": 0 },
+        "readonly": { "type": "boolean" },
+        "mode": { "type": ["integer", "null"], "minimum": 0 },
+        "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+        "extension": { "type": ["string", "null"] },
+        "detected_mime": { "type": ["string", "null"] },
+        "encoding": { "type": ["string", "null"] },
+        "entropy": { "type": ["number", "null"], "minimum": 0 },
+        "line_count": { "type": ["integer", "null"], "minimum": 0 },
+        "max_line_length": { "type": ["integer", "null"], "minimum": 0 },
+        "symlink_target": { "type": ["string", "null"] },
+        "roles": { "type": "array", "items": { "type": "string" } },
+        "raw_signals": { "type": "array", "items": { "type": "string" } },
+        "content_scanned": { "type": "boolean" },
+        "parsed_language": { "type": ["string", "null"] }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "severity", "confidence", "score", "title", "message", "file", "line", "evidence"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "severity": { "$ref": "#/definitions/severity" },
+        "confidence": { "enum": ["low", "medium", "high", "very_high"] },
+        "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "title": { "type": "string" },
+        "message": { "type": "string" },
+        "file": { "type": ["string", "null"] },
+        "line": { "type": ["integer", "null"], "minimum": 1 },
+        "evidence": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

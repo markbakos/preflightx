@@ -78,9 +78,48 @@ mod tests {
     fn does_not_flag_incomplete_indicator_sets_or_clean_text() {
         for text in [
             b"DownloadString FromBase64String".as_slice(),
+            b"createDecipheriv('aes-256-cbc', key, iv)".as_slice(),
             b"ordinary package documentation".as_slice(),
+            b"Download + String FromBase64 + String Invoke + Expression".as_slice(),
         ] {
             assert!(analyze("readme.txt", text).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn retains_hits_after_case_and_layout_evasion_mutations() {
+        for (path, text, expected) in [
+            (
+                "install.ps1",
+                b"downloadstring\n# staging\nFROMBASE64STRING\ninvoke-expression".as_slice(),
+                "YARA-POWERSHELL-DOWNLOAD-EXEC",
+            ),
+            (
+                "loader.js",
+                b"CREATEDECIPHERIV('AES-256-CBC', key, iv); return new\n\tFunction(code)"
+                    .as_slice(),
+                "YARA-JS-ENCRYPTED-LOADER",
+            ),
+        ] {
+            let findings = analyze(path, text).unwrap();
+            assert!(
+                findings.iter().any(|finding| finding.id == expected),
+                "evasion mutation was missed for {path}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flags_the_unmutated_encrypted_loader_pattern() {
+        let findings = analyze(
+            "loader.js",
+            b"createDecipheriv('aes-256-cbc', key, iv); new Function(payload)",
+        )
+        .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.id == "YARA-JS-ENCRYPTED-LOADER")
+        );
     }
 }

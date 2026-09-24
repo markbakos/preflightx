@@ -21,6 +21,75 @@ fn json_scan_completes_without_findings() {
     assert_eq!(report["summary"]["files"], 1);
     assert!(report.get("dependencies").is_none());
     assert!(report["summary"].get("dependencies").is_none());
+
+    assert_schema(
+        &report,
+        include_str!("../schemas/scan-report-v2.schema.json"),
+    );
+    let markdown = run(&[root.to_str().unwrap(), "--format", "markdown"]);
+    assert_eq!(markdown.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&markdown.stdout).starts_with("<!-- PreflightX Markdown v2 -->")
+    );
+    let sarif = run(&[root.to_str().unwrap(), "--format", "sarif"]);
+    assert_eq!(sarif.status.code(), Some(0));
+    let sarif: Value = serde_json::from_slice(&sarif.stdout).unwrap();
+    assert_schema(&sarif, include_str!("../schemas/sarif-schema-2.1.0.json"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn every_scan_profile_stays_offline_and_leaves_target_bytes_unchanged() {
+    let root = temporary_directory("offline-read-only-profiles");
+    let manifest = root.join("package.json");
+    let source = root.join("main.js");
+    let disguised = root.join("icon.woff2");
+    let manifest_bytes = br#"{"name":"inert-fixture","scripts":{"postinstall":"node setup.js"}}"#;
+    let source_bytes = b"export const answer = 42;\n";
+    let disguised_bytes = b"module.exports = 42;\n";
+    fs::write(&manifest, manifest_bytes).unwrap();
+    fs::write(&source, source_bytes).unwrap();
+    fs::write(&disguised, disguised_bytes).unwrap();
+    let root_argument = root.to_str().unwrap();
+
+    for arguments in [
+        vec![root_argument, "--format", "json"],
+        vec![root_argument, "--format", "json", "--quick"],
+        vec![root_argument, "--format", "json", "--deep"],
+    ] {
+        let output = run(&arguments);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["status"], "complete");
+        assert_eq!(report["network_access"], "disabled");
+        assert!(
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| { finding["id"] == "NPM-LIFECYCLE-SCRIPT" })
+        );
+        assert!(
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| {
+                    finding["id"] == "FILE-PARSEABLE-JAVASCRIPT" && finding["file"] == "icon.woff2"
+                })
+        );
+        assert_eq!(fs::read(&manifest).unwrap(), manifest_bytes);
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(fs::read(&disguised).unwrap(), disguised_bytes);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+    }
+
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -3205,6 +3274,16 @@ fn run(arguments: &[&str]) -> std::process::Output {
         .args(arguments)
         .output()
         .unwrap()
+}
+
+fn assert_schema(instance: &Value, schema_text: &str) {
+    let schema: Value = serde_json::from_str(schema_text).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let errors = validator
+        .iter_errors(instance)
+        .map(|error| format!("{} at {}", error, error.instance_path))
+        .collect::<Vec<_>>();
+    assert!(errors.is_empty(), "schema validation failed: {errors:#?}");
 }
 
 fn temporary_directory(label: &str) -> PathBuf {

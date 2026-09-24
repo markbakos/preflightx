@@ -92,7 +92,7 @@ pub fn json(report: &ScanReport) -> Result<String, serde_json::Error> {
 
 pub fn markdown(report: &ScanReport) -> String {
     let mut output = format!(
-        "# PreflightX {}\n\n- **Target:** `{}`\n- **Profile:** {}\n- **Status:** {}\n- **Files:** {}\n- **Risk:** {} ({}/100)\n- **Network:** {}\n\n",
+        "<!-- PreflightX Markdown v2 -->\n\n# PreflightX {}\n\n- **Target:** `{}`\n- **Profile:** {}\n- **Status:** {}\n- **Files:** {}\n- **Risk:** {} ({}/100)\n- **Network:** {}\n\n",
         markdown_escape(&report.scanner_version),
         markdown_escape(&report.target),
         markdown_escape(&report.profile),
@@ -332,6 +332,7 @@ fn push_line(output: &mut String, line: &str) {
 mod tests {
     use super::{markdown, sanitize, sarif};
     use crate::model::{Confidence, Finding, Risk, ScanReport, ScanStatus, ScanSummary, Severity};
+    use serde_json::Value;
 
     #[test]
     fn escapes_terminal_control_characters() {
@@ -364,6 +365,102 @@ mod tests {
             value["runs"][0]["results"][0]["properties"]["riskScore"],
             98
         );
+    }
+
+    #[test]
+    fn json_report_matches_the_versioned_v2_schema() {
+        let report = sample_report();
+        let value = serde_json::to_value(&report).unwrap();
+        assert_schema_valid(
+            include_str!("../schemas/scan-report-v2.schema.json"),
+            &value,
+        );
+
+        let mut unsupported_version = value.clone();
+        unsupported_version["schema_version"] = serde_json::json!(3);
+        assert_schema_invalid(
+            include_str!("../schemas/scan-report-v2.schema.json"),
+            &unsupported_version,
+        );
+
+        let mut removed_scope = value;
+        removed_scope["dependencies"] = serde_json::json!([]);
+        assert_schema_invalid(
+            include_str!("../schemas/scan-report-v2.schema.json"),
+            &removed_scope,
+        );
+    }
+
+    #[test]
+    fn sarif_report_matches_the_pinned_oasis_schema_without_remote_refs() {
+        let schema = include_str!("../schemas/sarif-schema-2.1.0.json");
+        let value: Value = serde_json::from_str(&sarif(&sample_report()).unwrap()).unwrap();
+        assert_schema_valid(schema, &value);
+
+        let mut wrong_version = value;
+        wrong_version["version"] = serde_json::json!("2.0.0");
+        assert_schema_invalid(schema, &wrong_version);
+    }
+
+    #[test]
+    fn markdown_has_a_versioned_header_and_stable_report_sections() {
+        let rendered = markdown(&sample_report());
+        assert!(rendered.starts_with("<!-- PreflightX Markdown v2 -->\n\n# PreflightX"));
+        for section in [
+            "**Target:**",
+            "**Profile:**",
+            "**Status:**",
+            "**Risk:**",
+            "**Network:**",
+            "**Rule:**",
+        ] {
+            assert!(
+                rendered.contains(section),
+                "missing Markdown section {section}"
+            );
+        }
+    }
+
+    fn assert_schema_valid(schema_text: &str, instance: &Value) {
+        let schema: Value = serde_json::from_str(schema_text).unwrap();
+        assert_schema_references_are_local(&schema);
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let errors = validator
+            .iter_errors(instance)
+            .map(|error| format!("{} at {}", error, error.instance_path))
+            .collect::<Vec<_>>();
+        assert!(errors.is_empty(), "schema validation failed: {errors:#?}");
+    }
+
+    fn assert_schema_invalid(schema_text: &str, instance: &Value) {
+        let schema: Value = serde_json::from_str(schema_text).unwrap();
+        assert_schema_references_are_local(&schema);
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(!validator.is_valid(instance));
+    }
+
+    fn assert_schema_references_are_local(value: &Value) {
+        match value {
+            Value::Object(properties) => {
+                if let Some(reference) = properties.get("$ref") {
+                    assert!(
+                        reference
+                            .as_str()
+                            .is_some_and(|value| value.starts_with("#/")),
+                        "schema contains a non-local reference: {reference}"
+                    );
+                }
+                for value in properties.values() {
+                    assert_schema_references_are_local(value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    assert_schema_references_are_local(value);
+                }
+            }
+            _ => {}
+        }
     }
 
     #[test]

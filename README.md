@@ -2,7 +2,7 @@
 
 A local-first, static security scanner for inspecting untrusted source repositories before executing them.
 
-> Development status: Stage 3 is in progress. It adds Markdown/SARIF, embedded YARA-X signatures, bounded scanning of archives already present in the repository, isolated Rust Git history/diff analysis, initial multi-language heuristics, and quick/default/deep profiles. Package reputation and registry artifact retrieval are outside PreflightX's scope. Broader corpus, evasion, schema, and cross-platform acceptance gates remain open.
+> Development status: Stage 3 is complete for its local implementation and acceptance checks. It adds Markdown/SARIF, embedded YARA-X signatures, bounded scanning of archives already in the repository, isolated Rust Git history/diff analysis, initial same-file multi-language heuristics, and quick/default/deep profiles. Package reputation and registry artifact retrieval are outside PreflightX's scope. Full fuzz campaigns, broad corpus calibration, and observed macOS/Windows runtime results remain Stage 4 release gates; CI is configured for all three operating systems.
 
 PreflightX is designed to remain offline by default, treat every target file as hostile, never execute target code, and never modify the repository being inspected.
 

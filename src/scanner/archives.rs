@@ -384,6 +384,7 @@ fn safe_member_path(raw: &[u8]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{Limits, extract, safe_member_path};
+    use flate2::{Compression, write::GzEncoder};
     use std::io::{Cursor, Write};
     use std::time::Duration;
     use zip::{ZipWriter, write::SimpleFileOptions};
@@ -414,6 +415,43 @@ mod tests {
         let result = extract("bad.zip", b"PK\x03\x04broken", limits());
         assert!(result.files.is_empty());
         assert!(!result.incomplete_reasons.is_empty());
+    }
+
+    #[test]
+    fn corrupt_zip_member_is_not_returned_as_scanned_content() {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "payload.txt",
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer.write_all(b"ordinary inert text").unwrap();
+        let mut archive = writer.finish().unwrap().into_inner();
+        let offset = archive
+            .windows(b"ordinary inert text".len())
+            .position(|window| window == b"ordinary inert text")
+            .unwrap();
+        archive[offset] ^= 1;
+
+        let result = extract("corrupt-member.zip", &archive, limits());
+        assert!(result.files.is_empty());
+        assert!(result.incomplete_reasons.iter().any(|reason| {
+            reason.contains("cannot decompress") || reason.contains("size mismatch")
+        }));
+    }
+
+    #[test]
+    fn malformed_gzip_and_tar_are_incomplete() {
+        let bad_gzip = extract("bad.gz", b"\x1f\x8bnot-a-gzip-stream", limits());
+        assert!(bad_gzip.files.is_empty());
+        assert!(!bad_gzip.incomplete_reasons.is_empty());
+
+        let mut bad_tar = vec![0_u8; 512];
+        bad_tar[257..262].copy_from_slice(b"ustar");
+        let bad_tar = extract("bad.tar", &bad_tar, limits());
+        assert!(bad_tar.files.is_empty());
+        assert!(!bad_tar.incomplete_reasons.is_empty());
     }
 
     fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -459,6 +497,45 @@ mod tests {
     }
 
     #[test]
+    fn skips_archive_symlink_and_hardlink_members() {
+        let mut zip_writer = ZipWriter::new(Cursor::new(Vec::new()));
+        zip_writer
+            .add_symlink("escape", "../outside", SimpleFileOptions::default())
+            .unwrap();
+        let zip_bytes = zip_writer.finish().unwrap().into_inner();
+        let zip_result = extract("links.zip", &zip_bytes, limits());
+        assert!(zip_result.files.is_empty());
+        assert!(
+            zip_result
+                .incomplete_reasons
+                .iter()
+                .any(|reason| reason.contains("ZIP symlink member skipped"))
+        );
+
+        let mut tar_builder = tar::Builder::new(Cursor::new(Vec::new()));
+        for (name, entry_type) in [
+            ("symlink", tar::EntryType::Symlink),
+            ("hardlink", tar::EntryType::Link),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(entry_type);
+            header.set_size(0);
+            tar_builder
+                .append_link(&mut header, name, "../outside")
+                .unwrap();
+        }
+        let tar_bytes = tar_builder.into_inner().unwrap().into_inner();
+        let tar_result = extract("links.tar", &tar_bytes, limits());
+        assert!(tar_result.files.is_empty());
+        assert!(
+            tar_result
+                .incomplete_reasons
+                .iter()
+                .any(|reason| { reason.contains("TAR link member skipped") })
+        );
+    }
+
+    #[test]
     fn enforces_member_count_before_extracting_more_content() {
         let archive = zip(&[("one.txt", b"1"), ("two.txt", b"2")]);
         let result = extract(
@@ -471,6 +548,49 @@ mod tests {
         );
         assert_eq!(result.files.len(), 1);
         assert!(!result.incomplete_reasons.is_empty());
+    }
+
+    #[test]
+    fn expansion_limit_skips_the_member_and_marks_coverage_incomplete() {
+        let archive = zip(&[("large.txt", b"more than three bytes")]);
+        let result = extract(
+            "limited.zip",
+            &archive,
+            Limits {
+                expanded_bytes: 3,
+                ..limits()
+            },
+        );
+        assert!(result.files.is_empty());
+        assert!(
+            result
+                .incomplete_reasons
+                .iter()
+                .any(|reason| { reason.contains("expanded byte limit") })
+        );
+    }
+
+    #[test]
+    fn gzip_expansion_ratio_limit_stops_compression_bombs() {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&vec![0; 4 * 1024 * 1024]).unwrap();
+        let gzip = encoder.finish().unwrap();
+        let result = extract(
+            "bomb.gz",
+            &gzip,
+            Limits {
+                member_bytes: 8 * 1024 * 1024,
+                expanded_bytes: 8 * 1024 * 1024,
+                ..limits()
+            },
+        );
+        assert!(result.files.is_empty());
+        assert!(
+            result
+                .incomplete_reasons
+                .iter()
+                .any(|reason| { reason.contains("compression ratio limit") })
+        );
     }
 
     #[test]

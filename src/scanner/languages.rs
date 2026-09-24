@@ -295,4 +295,25 @@ mod tests {
                 .any(|finding| finding.id.starts_with("LANG-REMOTE"))
         );
     }
+
+    #[test]
+    fn extra_language_heuristic_is_limited_to_one_file_and_marks_execution_roots() {
+        assert!(
+            analyze("download.py", Some("requests.get(url)"))
+                .findings
+                .is_empty()
+        );
+        assert!(
+            analyze("execute.py", Some("exec(payload)"))
+                .findings
+                .is_empty()
+        );
+
+        let root = analyze("setup.py", Some("print('setup')"));
+        assert!(
+            root.findings
+                .iter()
+                .any(|finding| { finding.id == "LANG-EXECUTION-ROOT" })
+        );
+    }
 }
