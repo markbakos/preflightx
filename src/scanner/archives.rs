@@ -454,6 +454,75 @@ mod tests {
         assert!(!bad_tar.incomplete_reasons.is_empty());
     }
 
+    #[test]
+    fn deterministic_archive_mutations_stay_within_the_scan_budget() {
+        let zip = zip(&[("payload.txt", b"inert archive fixture")]);
+        let mut gzip_encoder = GzEncoder::new(Vec::new(), Compression::default());
+        gzip_encoder.write_all(b"inert gzip fixture").unwrap();
+        let gzip = gzip_encoder.finish().unwrap();
+        let mut tar_builder = tar::Builder::new(Cursor::new(Vec::new()));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(b"inert tar fixture".len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar_builder
+            .append_data(&mut header, "payload.txt", &b"inert tar fixture"[..])
+            .unwrap();
+        let tar = tar_builder.into_inner().unwrap().into_inner();
+
+        for (archive_index, seed) in [zip, gzip, tar].iter().enumerate() {
+            let baseline = extract("inert.archive", seed, limits());
+            assert_eq!(baseline.files.len(), 1);
+            for iteration in 0..64_u64 {
+                let bytes = mutate_archive(seed, (archive_index as u64) * 64 + iteration);
+                let result = extract(
+                    "mutation.bin",
+                    &bytes,
+                    Limits {
+                        depth: 2,
+                        members: 8,
+                        expanded_bytes: 64 * 1024,
+                        member_bytes: 32 * 1024,
+                        time_limit: Duration::from_millis(250),
+                    },
+                );
+                assert!(result.files.len() <= 8);
+                assert!(
+                    result
+                        .files
+                        .iter()
+                        .all(|file| file.bytes.len() <= 32 * 1024)
+                );
+                assert!(
+                    result
+                        .files
+                        .iter()
+                        .map(|file| file.bytes.len() as u64)
+                        .sum::<u64>()
+                        <= 64 * 1024
+                );
+            }
+        }
+    }
+
+    fn mutate_archive(seed: &[u8], iteration: u64) -> Vec<u8> {
+        let mut bytes = seed.to_vec();
+        let mut state = iteration.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..=iteration % 4 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let index = state as usize % bytes.len();
+            bytes[index] ^= ((state >> 32) as u8).max(1);
+        }
+        match iteration % 4 {
+            0 => bytes.truncate(state as usize % bytes.len()),
+            1 => bytes.extend_from_slice(&state.to_le_bytes()[..4]),
+            _ => {}
+        }
+        bytes
+    }
+
     fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         for (path, content) in entries {
