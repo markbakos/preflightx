@@ -1,7 +1,6 @@
 mod analyzers;
 mod archives;
 mod classifier;
-mod dependencies;
 mod graph;
 mod js;
 mod languages;
@@ -17,19 +16,13 @@ pub struct ScanOptions {
     pub quick: bool,
     pub deep: bool,
     pub history: bool,
-    pub dependencies: bool,
-    pub online: bool,
 }
 
 const MAX_SEMANTIC_MODULES: usize = 20_000;
 const MAX_SEMANTIC_BYTES: usize = 64 * 1024 * 1024;
-const MAX_ONLINE_PACKAGES: usize = 1_000;
-const MAX_ONLINE_ARCHIVE_FILES: usize = 20_000;
-const MAX_ONLINE_EXPANDED_BYTES: u64 = 512 * 1024 * 1024;
 
 use crate::model::{Risk, ScanReport, ScanStatus, ScanSummary, Severity};
 use std::{
-    collections::BTreeMap,
     path::Path,
     time::{Duration, Instant},
 };
@@ -49,11 +42,9 @@ pub fn scan_with_options(path: &Path, limits: &ScanLimits, options: &ScanOptions
         bounded_limits.max_entries = bounded_limits.max_entries.min(20_000);
         bounded_limits.max_file_bytes = bounded_limits.max_file_bytes.min(16 * 1024 * 1024);
         bounded_limits.max_total_bytes = bounded_limits.max_total_bytes.min(512 * 1024 * 1024);
-        bounded_limits.max_dependencies = bounded_limits.max_dependencies.min(50_000);
     }
     let limits = &bounded_limits;
     let mut files = Vec::new();
-    let mut dependencies = Vec::new();
     let mut findings = Vec::new();
     let mut analyzer_incomplete = Vec::new();
     let mut modules = Vec::new();
@@ -84,13 +75,6 @@ pub fn scan_with_options(path: &Path, limits: &ScanLimits, options: &ScanOptions
         let mut classification =
             classifier::classify(&input.relative, &input.path, &input.metadata, &bytes);
         analyzer_incomplete.append(&mut classification.incomplete_reasons);
-        if let Some(sha256) = classification.record.sha256.as_deref() {
-            match crate::threat_db::hash_finding(&input.relative, sha256) {
-                Ok(Some(finding)) => classification.findings.push(finding),
-                Ok(None) => {}
-                Err(error) => analyzer_incomplete.push(error),
-            }
-        }
         let metadata = analyzers::analyze(&input.relative, classification.text.as_deref());
         let javascript = js::analyze(&input.relative, classification.text.as_deref());
         let language = languages::analyze(&input.relative, classification.text.as_deref());
@@ -180,13 +164,6 @@ pub fn scan_with_options(path: &Path, limits: &ScanLimits, options: &ScanOptions
             "finding limit reached",
             &mut analyzer_incomplete,
         );
-        append_limited(
-            &mut dependencies,
-            metadata.dependencies,
-            limits.max_dependencies,
-            "dependency record limit reached",
-            &mut analyzer_incomplete,
-        );
         analyzer_incomplete.extend(metadata.incomplete_reasons);
         analyzer_incomplete.extend(javascript.incomplete_reasons);
         analyzer_incomplete.extend(language.incomplete_reasons);
@@ -241,7 +218,6 @@ pub fn scan_with_options(path: &Path, limits: &ScanLimits, options: &ScanOptions
                     virtual_file.path,
                     &virtual_file.bytes,
                     &mut files,
-                    &mut dependencies,
                     &mut findings,
                     &mut modules,
                     &mut roots,
@@ -259,93 +235,6 @@ pub fn scan_with_options(path: &Path, limits: &ScanLimits, options: &ScanOptions
     walk.files = walk.files.saturating_add(archive_file_count);
     walk.content_bytes = walk.content_bytes.saturating_add(archive_content_bytes);
     walk.incomplete_reasons.append(&mut archive_incomplete);
-    dependencies = deduplicate_dependencies(dependencies);
-    let mut online_incomplete = Vec::new();
-    let mut online_file_count = 0_u64;
-    let mut online_content_bytes = 0_u64;
-    if options.online {
-        let agent = dependencies::npm_agent();
-        let online_dependencies = dependencies.clone();
-        let online_limit = if options.quick {
-            50
-        } else {
-            MAX_ONLINE_PACKAGES
-        };
-        let online_deadline =
-            Instant::now() + Duration::from_secs(if options.quick { 60 } else { 5 * 60 });
-        for (index, dependency) in online_dependencies.iter().enumerate() {
-            if index >= online_limit {
-                online_incomplete.push(format!(
-                    "online npm artifact limit of {online_limit} reached"
-                ));
-                break;
-            }
-            if Instant::now() >= online_deadline {
-                online_incomplete.push(format!(
-                    "online dependency time limit of {} seconds reached",
-                    if options.quick { 60 } else { 300 }
-                ));
-                break;
-            }
-            match dependencies::download_npm(&agent, dependency) {
-                Ok(bytes) => {
-                    let artifact_path = artifact_path(dependency);
-                    analyze_virtual_file(
-                        artifact_path.clone(),
-                        &bytes,
-                        &mut files,
-                        &mut dependencies,
-                        &mut findings,
-                        &mut modules,
-                        &mut roots,
-                        &mut semantic_bytes,
-                        &mut semantic_limit_reported,
-                        &mut online_incomplete,
-                        limits,
-                    );
-                    let remaining_files =
-                        MAX_ONLINE_ARCHIVE_FILES.saturating_sub(online_file_count as usize);
-                    let remaining_bytes =
-                        MAX_ONLINE_EXPANDED_BYTES.saturating_sub(online_content_bytes);
-                    let expanded = archives::extract(
-                        &artifact_path,
-                        &bytes,
-                        archives::Limits {
-                            depth: 4,
-                            members: remaining_files,
-                            expanded_bytes: remaining_bytes,
-                            member_bytes: 16 * 1024 * 1024,
-                            time_limit: online_deadline.saturating_duration_since(Instant::now()),
-                        },
-                    );
-                    for file in expanded.files {
-                        online_file_count += 1;
-                        online_content_bytes =
-                            online_content_bytes.saturating_add(file.bytes.len() as u64);
-                        analyze_virtual_file(
-                            file.path,
-                            &file.bytes,
-                            &mut files,
-                            &mut dependencies,
-                            &mut findings,
-                            &mut modules,
-                            &mut roots,
-                            &mut semantic_bytes,
-                            &mut semantic_limit_reported,
-                            &mut online_incomplete,
-                            limits,
-                        );
-                    }
-                    online_incomplete.extend(expanded.incomplete_reasons);
-                }
-                Err(error) => online_incomplete.push(error),
-            }
-        }
-    }
-    walk.entries = walk.entries.saturating_add(online_file_count);
-    walk.files = walk.files.saturating_add(online_file_count);
-    walk.content_bytes = walk.content_bytes.saturating_add(online_content_bytes);
-    walk.incomplete_reasons.append(&mut online_incomplete);
     files.append(&mut walk.other_records);
     let graph = graph::build(&modules, &roots, &files);
     let flows = js::analyze_flows(&modules, &graph.reachable);
@@ -368,21 +257,6 @@ pub fn scan_with_options(path: &Path, limits: &ScanLimits, options: &ScanOptions
     append_limited(
         &mut findings,
         walk.findings,
-        limits.max_findings,
-        "finding limit reached",
-        &mut analyzer_incomplete,
-    );
-    let mut threat_findings = Vec::new();
-    for dependency in &dependencies {
-        match crate::threat_db::package_finding(dependency) {
-            Ok(Some(finding)) => threat_findings.push(finding),
-            Ok(None) => {}
-            Err(error) => analyzer_incomplete.push(error),
-        }
-    }
-    append_limited(
-        &mut findings,
-        threat_findings,
         limits.max_findings,
         "finding limit reached",
         &mut analyzer_incomplete,
@@ -432,7 +306,7 @@ pub fn scan_with_options(path: &Path, limits: &ScanLimits, options: &ScanOptions
     };
 
     ScanReport {
-        schema_version: 1,
+        schema_version: 2,
         scanner: "preflightx".to_owned(),
         scanner_version: env!("CARGO_PKG_VERSION").to_owned(),
         target: display_path(&walk.root),
@@ -445,11 +319,7 @@ pub fn scan_with_options(path: &Path, limits: &ScanLimits, options: &ScanOptions
         }
         .to_owned(),
         status,
-        network_access: if options.online {
-            "enabled for HTTPS npm registry artifact downloads".to_owned()
-        } else {
-            "disabled".to_owned()
-        },
+        network_access: "disabled".to_owned(),
         risk: Risk { severity, score },
         summary: ScanSummary {
             entries: walk.entries,
@@ -458,11 +328,9 @@ pub fn scan_with_options(path: &Path, limits: &ScanLimits, options: &ScanOptions
             symlinks: walk.symlinks,
             special_files: walk.special_files,
             content_bytes: walk.content_bytes,
-            dependencies: dependencies.len() as u64,
             findings: findings.len() as u64,
         },
         files,
-        dependencies,
         findings,
         unresolved_edges: graph.unresolved,
         incomplete_reasons: walk.incomplete_reasons,
@@ -477,23 +345,9 @@ pub(crate) fn analyze_git_blob(
     let metadata = analyzers::analyze(path, classification.text.as_deref());
     let javascript = js::analyze(path, classification.text.as_deref());
     let language = languages::analyze(path, classification.text.as_deref());
-    for dependency in &metadata.dependencies {
-        match crate::threat_db::package_finding(dependency) {
-            Ok(Some(finding)) => classification.findings.push(finding),
-            Ok(None) => {}
-            Err(error) => classification.incomplete_reasons.push(error),
-        }
-    }
     classification.findings.extend(metadata.findings);
     classification.findings.extend(javascript.findings);
     classification.findings.extend(language.findings);
-    if let Some(sha256) = classification.record.sha256.as_deref() {
-        match crate::threat_db::hash_finding(path, sha256) {
-            Ok(Some(finding)) => classification.findings.push(finding),
-            Ok(None) => {}
-            Err(error) => classification.incomplete_reasons.push(error),
-        }
-    }
     classification
         .incomplete_reasons
         .extend(metadata.incomplete_reasons);
@@ -506,46 +360,12 @@ pub(crate) fn analyze_git_blob(
     (classification.findings, classification.incomplete_reasons)
 }
 
-fn artifact_path(dependency: &crate::model::DependencyRecord) -> String {
-    let name = dependency
-        .name
-        .split('/')
-        .map(safe_path_component)
-        .collect::<Vec<_>>()
-        .join("/");
-    let version = dependency
-        .version
-        .as_deref()
-        .map(safe_path_component)
-        .unwrap_or_else(|| "unknown".to_owned());
-    format!("artifacts/npm/{name}/{version}.tgz")
-}
-
-fn safe_path_component(value: &str) -> String {
-    let mut component = value
-        .chars()
-        .take(128)
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '@' | '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if component.is_empty() || component == "." || component == ".." {
-        component = "unknown".to_owned();
-    }
-    component
-}
-
 // One virtual member updates the scanner's shared finding, coverage, and graph collections.
 #[allow(clippy::too_many_arguments)]
 fn analyze_virtual_file(
     path: String,
     bytes: &[u8],
     files: &mut Vec<crate::model::FileRecord>,
-    dependencies: &mut Vec<crate::model::DependencyRecord>,
     findings: &mut Vec<crate::model::Finding>,
     modules: &mut Vec<js::ModuleFacts>,
     roots: &mut Vec<graph::Root>,
@@ -556,13 +376,6 @@ fn analyze_virtual_file(
 ) {
     let mut classification = classifier::classify_virtual(&path, bytes);
     incomplete.append(&mut classification.incomplete_reasons);
-    if let Some(sha256) = classification.record.sha256.as_deref() {
-        match crate::threat_db::hash_finding(&path, sha256) {
-            Ok(Some(finding)) => classification.findings.push(finding),
-            Ok(None) => {}
-            Err(error) => incomplete.push(error),
-        }
-    }
     let metadata = analyzers::analyze(&path, classification.text.as_deref());
     let javascript = js::analyze(&path, classification.text.as_deref());
     let language = languages::analyze(&path, classification.text.as_deref());
@@ -647,33 +460,10 @@ fn analyze_virtual_file(
         "finding limit reached",
         incomplete,
     );
-    append_limited(
-        dependencies,
-        metadata.dependencies,
-        limits.max_dependencies,
-        "dependency record limit reached",
-        incomplete,
-    );
     incomplete.extend(metadata.incomplete_reasons);
     incomplete.extend(javascript.incomplete_reasons);
     incomplete.extend(language.incomplete_reasons);
     files.push(classification.record);
-}
-
-fn deduplicate_dependencies(
-    dependencies: Vec<crate::model::DependencyRecord>,
-) -> Vec<crate::model::DependencyRecord> {
-    let mut unique = BTreeMap::new();
-    for dependency in dependencies {
-        let key = (
-            dependency.ecosystem.clone(),
-            dependency.name.clone(),
-            dependency.version.clone(),
-            dependency.source_file.clone(),
-        );
-        unique.entry(key).or_insert(dependency);
-    }
-    unique.into_values().collect()
 }
 
 fn append_limited<T>(

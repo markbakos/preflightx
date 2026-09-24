@@ -81,16 +81,6 @@ pub struct FileRecord {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct DependencyRecord {
-    pub ecosystem: String,
-    pub name: String,
-    pub version: Option<String>,
-    pub integrity: Option<String>,
-    pub resolved: Option<String>,
-    pub source_file: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
 pub struct Finding {
     pub id: String,
     pub severity: Severity,
@@ -111,7 +101,6 @@ pub struct ScanSummary {
     pub symlinks: u64,
     pub special_files: u64,
     pub content_bytes: u64,
-    pub dependencies: u64,
     pub findings: u64,
 }
 
@@ -133,7 +122,6 @@ pub struct ScanReport {
     pub risk: Risk,
     pub summary: ScanSummary,
     pub files: Vec<FileRecord>,
-    pub dependencies: Vec<DependencyRecord>,
     pub findings: Vec<Finding>,
     pub unresolved_edges: Vec<String>,
     pub incomplete_reasons: Vec<String>,

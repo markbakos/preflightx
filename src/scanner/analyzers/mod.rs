@@ -1,12 +1,11 @@
 mod ide;
 mod npm;
 
-use crate::model::{DependencyRecord, Finding};
+use crate::model::Finding;
 
 #[derive(Default)]
 pub struct MetadataAnalysis {
     pub findings: Vec<Finding>,
-    pub dependencies: Vec<DependencyRecord>,
     pub incomplete_reasons: Vec<String>,
 }
 
@@ -24,14 +23,7 @@ pub fn analyze(path: &str, text: Option<&str>) -> MetadataAnalysis {
         return MetadataAnalysis::default();
     };
     let name = path.rsplit('/').next().unwrap_or(path);
-    let npm = matches!(
-        name,
-        "package.json"
-            | "package-lock.json"
-            | "npm-shrinkwrap.json"
-            | "yarn.lock"
-            | "pnpm-lock.yaml"
-    );
+    let npm = name == "package.json";
     let ide = path.starts_with(".vscode/") || path == ".devcontainer/devcontainer.json";
     if (npm || ide) && text.len() > 4 * 1024 * 1024 {
         return MetadataAnalysis {
@@ -42,7 +34,7 @@ pub fn analyze(path: &str, text: Option<&str>) -> MetadataAnalysis {
         };
     }
     if npm {
-        return npm::analyze(path, name, text);
+        return npm::analyze(path, text);
     }
     if ide {
         return ide::analyze(path, name, text);

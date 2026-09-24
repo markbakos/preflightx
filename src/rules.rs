@@ -137,14 +137,6 @@ pub const RULES: &[Rule] = &[
         description: "Content follows a large horizontal whitespace run.",
     },
     Rule {
-        id: "THREAT-KNOWN-MALICIOUS-HASH",
-        description: "A file SHA-256 matches a locally embedded malicious-artifact record.",
-    },
-    Rule {
-        id: "THREAT-KNOWN-MALICIOUS-PACKAGE",
-        description: "An exact resolved dependency version matches a locally embedded malicious-package record.",
-    },
-    Rule {
         id: "YARA-POWERSHELL-DOWNLOAD-EXEC",
         description: "A YARA-X signature matched a PowerShell download, decode, and execution pattern.",
     },

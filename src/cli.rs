@@ -11,10 +11,9 @@ Usage:
   preflightx rules show <rule-id>
   preflightx explain <finding-id>
   preflightx version
-  preflightx db status|update
   preflightx doctor
   preflightx diff <good-commit>..HEAD
-  preflightx <path> [--quick|--deep] [--history] [--dependencies [--online]]
+  preflightx <path> [--quick|--deep] [--history]
   preflightx --help
   preflightx --version
 
@@ -37,8 +36,6 @@ pub struct ScanArgs {
     pub quick: bool,
     pub deep: bool,
     pub history: bool,
-    pub dependencies: bool,
-    pub online: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -48,8 +45,6 @@ pub enum Command {
     Version,
     Rules,
     Rule(String),
-    DbStatus,
-    DbUpdate,
     Doctor,
     Diff(String),
 }
@@ -83,14 +78,6 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         let id = args.next().ok_or("explain requires a finding ID")?;
         return no_extra(args, Command::Rule(id.to_string_lossy().into_owned()));
     }
-    if first == "db" {
-        args.next();
-        return match args.next() {
-            Some(command) if command == "status" => no_extra(args, Command::DbStatus),
-            Some(command) if command == "update" => no_extra(args, Command::DbUpdate),
-            _ => Err("expected db status or db update".to_owned()),
-        };
-    }
     if first == "doctor" {
         args.next();
         return no_extra(args, Command::Doctor);
@@ -121,8 +108,6 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut quick = false;
     let mut deep = false;
     let mut history = false;
-    let mut dependencies = false;
-    let mut online = false;
     while let Some(argument) = args.next() {
         if argument == "--format" {
             format = parse_format(args.next().ok_or("--format requires a value")?)?;
@@ -138,10 +123,6 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             deep = true;
         } else if argument == "--history" {
             history = true;
-        } else if argument == "--dependencies" {
-            dependencies = true;
-        } else if argument == "--online" {
-            online = true;
         } else if argument.to_string_lossy().starts_with('-') {
             return Err(format!("unknown option: {}", argument.to_string_lossy()));
         } else if path.replace(PathBuf::from(argument)).is_some() {
@@ -152,10 +133,6 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     if quick && deep {
         return Err("--quick and --deep cannot be combined".to_owned());
     }
-    if online && !dependencies {
-        return Err("--online requires --dependencies".to_owned());
-    }
-
     Ok(Command::Scan(ScanArgs {
         path: path.ok_or("scan requires a path")?,
         format,
@@ -163,8 +140,6 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         quick,
         deep,
         history,
-        dependencies,
-        online,
     }))
 }
 
@@ -220,8 +195,6 @@ mod tests {
                 quick: false,
                 deep: false,
                 history: false,
-                dependencies: false,
-                online: false,
             }))
         );
         assert_eq!(
@@ -239,8 +212,6 @@ mod tests {
                 quick: false,
                 deep: false,
                 history: false,
-                dependencies: false,
-                online: false,
             }))
         );
     }
@@ -259,7 +230,11 @@ mod tests {
         );
         assert_eq!(
             parse(args(&["repo", "--online"])),
-            Err("--online requires --dependencies".to_owned())
+            Err("unknown option: --online".to_owned())
+        );
+        assert_eq!(
+            parse(args(&["repo", "--dependencies"])),
+            Err("unknown option: --dependencies".to_owned())
         );
     }
 
@@ -275,15 +250,13 @@ mod tests {
                     quick: false,
                     deep: false,
                     history: false,
-                    dependencies: false,
-                    online: false,
                 }))
             );
         }
     }
 
     #[test]
-    fn parses_explicit_deep_history_and_online_dependency_modes() {
+    fn parses_explicit_deep_history_and_rejects_removed_package_modes() {
         assert!(matches!(
             parse(args(&["repo", "--deep", "--history"])),
             Ok(Command::Scan(ScanArgs {
@@ -292,14 +265,10 @@ mod tests {
                 ..
             }))
         ));
-        assert!(matches!(
+        assert_eq!(
             parse(args(&["repo", "--dependencies", "--online"])),
-            Ok(Command::Scan(ScanArgs {
-                dependencies: true,
-                online: true,
-                ..
-            }))
-        ));
+            Err("unknown option: --dependencies".to_owned())
+        );
         assert_eq!(
             parse(args(&["repo", "--quick", "--deep"])),
             Err("--quick and --deep cannot be combined".to_owned())

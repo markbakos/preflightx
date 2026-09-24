@@ -30,10 +30,6 @@ pub fn terminal(report: &ScanReport) -> String {
     );
     push_line(
         &mut output,
-        &format!("Dependencies {}", report.summary.dependencies),
-    );
-    push_line(
-        &mut output,
         &format!("Content      {} bytes", report.summary.content_bytes),
     );
 
@@ -96,13 +92,12 @@ pub fn json(report: &ScanReport) -> Result<String, serde_json::Error> {
 
 pub fn markdown(report: &ScanReport) -> String {
     let mut output = format!(
-        "# PreflightX {}\n\n- **Target:** `{}`\n- **Profile:** {}\n- **Status:** {}\n- **Files:** {}\n- **Dependencies:** {}\n- **Risk:** {} ({}/100)\n- **Network:** {}\n\n",
+        "# PreflightX {}\n\n- **Target:** `{}`\n- **Profile:** {}\n- **Status:** {}\n- **Files:** {}\n- **Risk:** {} ({}/100)\n- **Network:** {}\n\n",
         markdown_escape(&report.scanner_version),
         markdown_escape(&report.target),
         markdown_escape(&report.profile),
         status_label(report.status),
         report.summary.files,
-        report.summary.dependencies,
         report.risk.severity.label(),
         report.risk.score,
         markdown_escape(&report.network_access),
@@ -385,7 +380,7 @@ mod tests {
 
     fn sample_report() -> ScanReport {
         ScanReport {
-            schema_version: 1,
+            schema_version: 2,
             scanner: "preflightx".to_owned(),
             scanner_version: "0.1.0".to_owned(),
             target: "fixture".to_owned(),
@@ -398,7 +393,6 @@ mod tests {
             },
             summary: ScanSummary::default(),
             files: Vec::new(),
-            dependencies: Vec::new(),
             findings: vec![Finding {
                 id: "REMOTE-EXECUTION".to_owned(),
                 severity: Severity::Critical,

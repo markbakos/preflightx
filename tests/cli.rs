@@ -16,8 +16,40 @@ fn json_scan_completes_without_findings() {
     assert_eq!(output.status.code(), Some(0));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["status"], "complete");
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["network_access"], "disabled");
     assert_eq!(report["summary"]["files"], 1);
+    assert!(report.get("dependencies").is_none());
+    assert!(report["summary"].get("dependencies").is_none());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn scans_package_scripts_as_code_triggers_without_package_identity_verdicts() {
+    let root = temporary_directory("package-metadata");
+    fs::write(
+        root.join("package.json"),
+        br#"{"name":"local-fixture","scripts":{"postinstall":"node setup.js"},"dependencies":{"inert-fixture-dependency":"1.2.3"}}"#,
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+
+    assert!(report["network_access"] == "disabled");
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["id"] == "NPM-LIFECYCLE-SCRIPT")
+    );
+    assert!(findings.iter().all(|finding| {
+        !finding["id"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("THREAT-KNOWN-MALICIOUS-PACKAGE")
+    }));
+    assert!(report.get("dependencies").is_none());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -3151,6 +3183,7 @@ fn incomplete_and_invalid_invocations_use_distinct_exit_codes() {
 
     assert_eq!(missing.status.code(), Some(2));
     assert_eq!(invalid.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("unknown option: --online"));
 }
 
 #[test]

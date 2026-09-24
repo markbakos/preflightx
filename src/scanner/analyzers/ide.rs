@@ -23,7 +23,6 @@ pub fn analyze(path: &str, name: &str, text: &str) -> MetadataAnalysis {
                 incomplete_reasons: vec![format!(
                     "could not parse developer-tool configuration {path}: {error}"
                 )],
-                ..MetadataAnalysis::default()
             };
         }
     };

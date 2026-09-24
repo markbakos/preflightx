@@ -6,7 +6,6 @@ description = "Pre-execution security scanner for untrusted source repositories"
 publish = false
 
 [dependencies]
-base64 = "0.23.1"
 infer = "0.22.0"
 flate2 = "1"
 gix = { version = "0.87", default-features = false, features = ["basic", "sha1", "sha256", "revision"] }
@@ -21,6 +20,5 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 tar = "0.4"
-ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 yara-x = { version = "1.20", default-features = false, features = ["constant-folding"] }
 zip = { version = "8.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
