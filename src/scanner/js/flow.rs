@@ -1132,12 +1132,14 @@ struct Evaluator<'a> {
     findings: Vec<Finding>,
     seen: std::collections::BTreeSet<(String, String, u64)>,
     work: usize,
+    total_work: usize,
     limited: bool,
     written: BTreeMap<String, Value>,
     stream_data: BTreeMap<(String, String), BTreeMap<String, Value>>,
 }
 
 const MAX_FLOW_WORK: usize = 100_000;
+const MAX_TOTAL_FLOW_WORK: usize = 1_000_000;
 const MAX_CALL_DEPTH: usize = 32;
 
 pub fn analyze_flows(
@@ -1145,6 +1147,7 @@ pub fn analyze_flows(
     reachable: &BTreeMap<String, Vec<String>>,
 ) -> FlowResult {
     let mut by_path = BTreeMap::new();
+    let mut limited_at = None;
     for module in modules {
         by_path.entry(module.path.as_str()).or_insert(module);
     }
@@ -1158,6 +1161,7 @@ pub fn analyze_flows(
         findings: Vec::new(),
         seen: std::collections::BTreeSet::new(),
         work: 0,
+        total_work: 0,
         limited: false,
         written: BTreeMap::new(),
         stream_data: BTreeMap::new(),
@@ -1172,8 +1176,12 @@ pub fn analyze_flows(
             continue;
         }
         evaluator.written.clear();
+        evaluator.work = 0;
         let mut environment = evaluator.imports(module);
         evaluator.run(&module.id, &module.flow.body, &mut environment, 0);
+        if evaluator.limited {
+            limited_at = Some(module.path.as_str());
+        }
     }
     let remote = evaluator
         .findings
@@ -1218,7 +1226,10 @@ pub fn analyze_flows(
         findings: evaluator.findings,
         incomplete_reasons: if evaluator.limited {
             vec![format!(
-                "JS/TS data-flow work limit of {MAX_FLOW_WORK} units or call depth {MAX_CALL_DEPTH} reached"
+                "JS/TS data-flow work limit of {MAX_FLOW_WORK} units per module, {MAX_TOTAL_FLOW_WORK} total units, or call depth {MAX_CALL_DEPTH} reached while analyzing {} (module work: {}, total work: {})",
+                limited_at.unwrap_or("an unknown module"),
+                evaluator.work,
+                evaluator.total_work
             )]
         } else {
             Vec::new()
@@ -1229,7 +1240,8 @@ pub fn analyze_flows(
 impl Evaluator<'_> {
     fn charge(&mut self, amount: usize) -> bool {
         self.work = self.work.saturating_add(amount);
-        if self.work > MAX_FLOW_WORK {
+        self.total_work = self.total_work.saturating_add(amount);
+        if self.work > MAX_FLOW_WORK || self.total_work > MAX_TOTAL_FLOW_WORK {
             self.limited = true;
             false
         } else {
