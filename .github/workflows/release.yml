@@ -1,0 +1,139 @@
+name: Draft release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+      - run: cargo test --locked
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  release:
+    needs: [test, lint]
+    if: vars.PREFLIGHTX_RELEASE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: release
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate release tag
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          TAG_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git cat-file -t "$TAG")" = tag
+          tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.sha')"
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object" --jq '.verification.verified' | grep -Fxq true
+          git merge-base --is-ancestor "$TAG_COMMIT" origin/main
+          version="${TAG#v}"
+          manifest_version="$(cargo metadata --locked --offline --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "preflightx") | .version')"
+          test "$version" = "$manifest_version"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build Linux x86_64 release binary
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target x86_64-unknown-linux-gnu
+          asset="preflightx-v${VERSION}-linux-x86_64.tar.gz"
+          package_dir="preflightx-v${VERSION}-linux-x86_64"
+          mkdir -p dist "$RUNNER_TEMP/$package_dir"
+          install -m 755 target/x86_64-unknown-linux-gnu/release/preflightx "$RUNNER_TEMP/$package_dir/preflightx"
+          install -m 644 LICENSE README.md "$RUNNER_TEMP/$package_dir/"
+          tar -czf "$GITHUB_WORKSPACE/dist/$asset" -C "$RUNNER_TEMP" "$package_dir"
+          printf '%s\n' "$asset" > dist/asset-name
+          mkdir -p dist/sbom-input
+          cp Cargo.toml Cargo.lock dist/sbom-input/
+
+      - name: Generate SPDX SBOM from the locked Rust dependency graph
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: ./dist/sbom-input
+          output-file: ./dist/preflightx-v${{ steps.version.outputs.value }}-linux-x86_64.spdx.json
+          format: spdx-json
+          syft-version: 1.42.3
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Smoke check the release binary in a benign fixture
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/preflightx-v${VERSION}-linux-x86_64/preflightx"
+          "$binary" --version
+          "$binary" doctor
+          fixture="$(mktemp -d "$RUNNER_TEMP/preflightx-smoke.XXXXXX")"
+          printf 'PreflightX release smoke fixture.\n' > "$fixture/README.txt"
+          "$binary" "$fixture" --format json | jq -e '.status == "complete" and .network_access == "disabled" and (.findings | length == 0)'
+
+      - name: Verify SBOM and create checksums
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          asset="$(cat dist/asset-name)"
+          sbom="preflightx-v${VERSION}-linux-x86_64.spdx.json"
+          jq -e '.spdxVersion == "SPDX-2.3" and (.packages | length > 0)' "dist/$sbom"
+          rm -rf dist/sbom-input dist/asset-name
+          (cd dist && sha256sum "$asset" "$sbom" > SHA256SUMS && sha256sum --check SHA256SUMS)
+
+      - name: Generate signed build provenance and SBOM attestation
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: dist/preflightx-v${{ steps.version.outputs.value }}-linux-x86_64.tar.gz
+          sbom-path: dist/preflightx-v${{ steps.version.outputs.value }}-linux-x86_64.spdx.json
+
+      - name: Create a draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            "dist/preflightx-v${VERSION}-linux-x86_64.tar.gz" \
+            "dist/preflightx-v${VERSION}-linux-x86_64.spdx.json" \
+            dist/SHA256SUMS \
+            --verify-tag \
+            --draft \
+            --title "PreflightX ${VERSION}" \
+            --generate-notes

@@ -1,0 +1,5 @@
+/.github/workflows/ @markbakos
+/Cargo.toml @markbakos
+/Cargo.lock @markbakos
+/src/rules.rs @markbakos
+/src/scanner/yara.rs @markbakos
