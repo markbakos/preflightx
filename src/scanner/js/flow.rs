@@ -88,22 +88,14 @@ pub enum Expr {
 
 const THROWN_VALUE: &str = "\0preflightx-thrown";
 
-struct Lower<'a> {
-    source: &'a str,
+struct Lower {
+    line_starts: Vec<u32>,
     line_offset: u64,
 }
 
-impl Lower<'_> {
+impl Lower {
     fn line(&self, offset: u32) -> u64 {
-        self.line_offset
-            + self
-                .source
-                .get(..offset as usize)
-                .unwrap_or_default()
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count() as u64
-            + 1
+        self.line_offset + self.line_starts.partition_point(|start| *start <= offset) as u64
     }
 
     fn binding(&self, pattern: &BindingPattern<'_>) -> Binding {
@@ -826,7 +818,13 @@ fn non_secret_environment_key(key: &str) -> bool {
 
 pub fn lower(program: &Program<'_>, source: &str, line_offset: u64) -> ModuleFlow {
     let lower = Lower {
-        source,
+        line_starts: std::iter::once(0)
+            .chain(
+                source
+                    .match_indices('\n')
+                    .map(|(offset, _)| (offset + 1) as u32),
+            )
+            .collect(),
         line_offset,
     };
     let mut imports = BTreeMap::new();
@@ -1082,6 +1080,44 @@ impl Value {
     fn file_target(&self) -> Option<String> {
         self.literal.clone().or_else(|| self.path_key.clone())
     }
+
+    fn work_size(&self, limit: usize) -> usize {
+        let mut size = 1usize;
+        for text in [
+            self.name.as_deref(),
+            self.literal.as_deref(),
+            self.path_hint.as_deref(),
+            self.path_key.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            size = size.saturating_add(text.len());
+            if size > limit {
+                return limit.saturating_add(1);
+            }
+        }
+        for route in self.labels.values() {
+            size = size.saturating_add(1);
+            for step in route {
+                size = size.saturating_add(step.len());
+                if size > limit {
+                    return limit.saturating_add(1);
+                }
+            }
+        }
+        for (key, value) in &self.fields {
+            size = size.saturating_add(1).saturating_add(key.len());
+            if size > limit {
+                return limit.saturating_add(1);
+            }
+            size = size.saturating_add(value.work_size(limit.saturating_sub(size)));
+            if size > limit {
+                return limit.saturating_add(1);
+            }
+        }
+        size
+    }
 }
 
 pub struct FlowResult {
@@ -1095,13 +1131,13 @@ struct Evaluator<'a> {
     reachable: &'a BTreeMap<String, Vec<String>>,
     findings: Vec<Finding>,
     seen: std::collections::BTreeSet<(String, String, u64)>,
-    steps: usize,
+    work: usize,
     limited: bool,
     written: BTreeMap<String, Value>,
     stream_data: BTreeMap<(String, String), BTreeMap<String, Value>>,
 }
 
-const MAX_FLOW_STEPS: usize = 100_000;
+const MAX_FLOW_WORK: usize = 100_000;
 const MAX_CALL_DEPTH: usize = 32;
 
 pub fn analyze_flows(
@@ -1121,7 +1157,7 @@ pub fn analyze_flows(
         reachable,
         findings: Vec::new(),
         seen: std::collections::BTreeSet::new(),
-        steps: 0,
+        work: 0,
         limited: false,
         written: BTreeMap::new(),
         stream_data: BTreeMap::new(),
@@ -1182,7 +1218,7 @@ pub fn analyze_flows(
         findings: evaluator.findings,
         incomplete_reasons: if evaluator.limited {
             vec![format!(
-                "JS/TS data-flow work limit of {MAX_FLOW_STEPS} steps or call depth {MAX_CALL_DEPTH} reached"
+                "JS/TS data-flow work limit of {MAX_FLOW_WORK} units or call depth {MAX_CALL_DEPTH} reached"
             )]
         } else {
             Vec::new()
@@ -1191,6 +1227,55 @@ pub fn analyze_flows(
 }
 
 impl Evaluator<'_> {
+    fn charge(&mut self, amount: usize) -> bool {
+        self.work = self.work.saturating_add(amount);
+        if self.work > MAX_FLOW_WORK {
+            self.limited = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn environment_work(environment: &BTreeMap<String, Value>) -> usize {
+        let mut work = 0usize;
+        for (name, value) in environment {
+            work = work
+                .saturating_add(1)
+                .saturating_add(name.len())
+                .saturating_add(value.work_size(MAX_FLOW_WORK.saturating_sub(work)));
+            if work > MAX_FLOW_WORK {
+                return MAX_FLOW_WORK.saturating_add(1);
+            }
+        }
+        work
+    }
+
+    fn fork_environment(
+        &mut self,
+        environment: &BTreeMap<String, Value>,
+    ) -> Option<BTreeMap<String, Value>> {
+        self.charge(Self::environment_work(environment))
+            .then(|| environment.clone())
+    }
+
+    fn fork_branches(
+        &mut self,
+        environment: &BTreeMap<String, Value>,
+    ) -> Option<(BTreeMap<String, Value>, BTreeMap<String, Value>)> {
+        let work = Self::environment_work(environment).saturating_mul(3);
+        self.charge(work)
+            .then(|| (environment.clone(), environment.clone()))
+    }
+
+    fn copy_value(&mut self, value: &Value) -> Value {
+        if self.charge(value.work_size(MAX_FLOW_WORK)) {
+            value.clone()
+        } else {
+            Value::default()
+        }
+    }
+
     fn file_path<'a>(&'a self, id: &'a str) -> &'a str {
         self.modules
             .get(id)
@@ -1234,9 +1319,7 @@ impl Evaluator<'_> {
             if environment.contains_key(THROWN_VALUE) {
                 break;
             }
-            self.steps += 1;
-            if self.steps > MAX_FLOW_STEPS {
-                self.limited = true;
+            if !self.charge(1) {
                 return None;
             }
             match statement {
@@ -1267,8 +1350,7 @@ impl Evaluator<'_> {
                         }
                         continue;
                     }
-                    let mut left = environment.clone();
-                    let mut right = environment.clone();
+                    let (mut left, mut right) = self.fork_branches(environment)?;
                     let a = self.run(path, yes, &mut left, depth + 1);
                     let b = self.run(path, no, &mut right, depth + 1);
                     let mut merged = left;
@@ -1289,7 +1371,7 @@ impl Evaluator<'_> {
                     }
                 }
                 Stmt::Iterate(binding, iterable, body) => {
-                    let mut iteration = environment.clone();
+                    let mut iteration = self.fork_environment(environment)?;
                     let value = self.eval(path, iterable, environment, depth);
                     self.bind(binding, value, &mut iteration);
                     if let Some(value) = self.run(path, body, &mut iteration, depth + 1) {
@@ -1307,7 +1389,7 @@ impl Evaluator<'_> {
                     finally,
                 } => {
                     // ponytail: explicit throws only; implicit JS exceptions need full completion records.
-                    let mut scope = environment.clone();
+                    let mut scope = self.fork_environment(environment)?;
                     scope.remove(THROWN_VALUE);
                     let mut result = self.run(path, body, &mut scope, depth + 1);
                     let mut thrown = scope.remove(THROWN_VALUE);
@@ -1432,15 +1514,15 @@ impl Evaluator<'_> {
         environment: &mut BTreeMap<String, Value>,
         depth: usize,
     ) -> Value {
-        if self.limited {
+        if !self.charge(1) {
             return Value::default();
         }
         let file_path = self.file_path(path).to_owned();
         match expression {
-            Expr::Name(name) => environment
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| Value::named(name.clone())),
+            Expr::Name(name) => match environment.get(name) {
+                Some(value) => self.copy_value(value),
+                None => Value::named(name.clone()),
+            },
             Expr::String(text) => Value::literal(text.clone()),
             Expr::Bool(_) => Value::default(),
             Expr::Member(object, property) => {
@@ -1669,7 +1751,9 @@ impl Evaluator<'_> {
             }
             Expr::Then(receiver, parameter, body) => {
                 let value = self.eval(path, receiver, environment, depth);
-                let mut scope = environment.clone();
+                let Some(mut scope) = self.fork_environment(environment) else {
+                    return Value::default();
+                };
                 self.bind(parameter, value, &mut scope);
                 let returned = self.run(path, body, &mut scope, depth + 1);
                 if let Some(thrown) = scope.remove(THROWN_VALUE) {
@@ -1709,7 +1793,9 @@ impl Evaluator<'_> {
                 );
                 let stream_data = stream && event == "data";
                 let stream_end = stream && event == "end";
-                let mut scope = environment.clone();
+                let Some(mut scope) = self.fork_environment(environment) else {
+                    return Value::default();
+                };
                 if stream_end && let Some(previous_chunks) = self.stream_data.get(&stream_key) {
                     for (name, value) in previous_chunks {
                         if let Some(existing) = scope.get_mut(name) {
@@ -1724,6 +1810,9 @@ impl Evaluator<'_> {
                 }
                 if stream_data {
                     // Stream data callbacks run before `end`; other async callback effects stay scoped.
+                    if !self.charge(Self::environment_work(&scope)) {
+                        return Value::default();
+                    }
                     let chunks = self.stream_data.entry(stream_key).or_default();
                     for (name, value) in scope {
                         if environment.contains_key(&name) {
@@ -1749,7 +1838,9 @@ impl Evaluator<'_> {
         let module = self.modules.get(path).copied();
         if let Some(module) = module {
             if let Some(function) = module.flow.functions.get(name).cloned() {
-                let scope = environment.clone();
+                let Some(scope) = self.fork_environment(environment) else {
+                    return Value::default();
+                };
                 let (value, thrown) =
                     self.call_function(path, name, &function, args, scope, depth + 1);
                 if let Some(thrown) = thrown {

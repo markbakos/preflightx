@@ -1263,6 +1263,80 @@ fn global_semantic_module_limit_is_reported_once() {
 }
 
 #[test]
+fn flow_environment_fork_work_is_bounded() {
+    let root = temporary_directory("flow-environment-fork-limit");
+    let mut source = String::new();
+    for index in 0..6_000 {
+        source.push_str(&format!("const value_{index} = {index};\n"));
+    }
+    for index in 0..6_000 {
+        source.push_str(&format!(
+            "if (gate_{index}) {{ const branch_{index} = {index}; }}\n"
+        ));
+    }
+    fs::write(root.join("main.js"), source.as_bytes()).unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "incomplete");
+    assert!(
+        report["incomplete_reasons"]
+            .to_string()
+            .contains("data-flow work limit")
+    );
+    assert_eq!(fs::read(root.join("main.js")).unwrap(), source.as_bytes());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recursive_flow_stops_at_the_call_depth_limit() {
+    let root = temporary_directory("flow-call-depth-limit");
+    fs::write(
+        root.join("main.js"),
+        b"function recurse() { recurse(); } recurse();",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "incomplete");
+    assert!(
+        report["incomplete_reasons"]
+            .to_string()
+            .contains("call depth 32")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repeated_large_value_copies_consume_bounded_flow_work() {
+    let root = temporary_directory("flow-value-copy-limit");
+    let mut properties = String::new();
+    for index in 0..5_000 {
+        properties.push_str(&format!("item_{index}: 'data',"));
+    }
+    let mut source = format!("const payload = {{{properties}}};\n");
+    source.push_str(&"consume(payload);\n".repeat(5_000));
+    fs::write(root.join("main.js"), source).unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "incomplete");
+    assert!(
+        report["incomplete_reasons"]
+            .to_string()
+            .contains("data-flow work limit")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn remote_data_survives_a_simple_character_xor_decoder() {
     let root = temporary_directory("xor-decoder");
     fs::write(
