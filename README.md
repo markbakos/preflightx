@@ -2,7 +2,7 @@
 
 A local-first, static security scanner for inspecting untrusted source repositories before executing them.
 
-> Development status: Stage 3 is complete for its local implementation and acceptance checks. It adds Markdown/SARIF, embedded YARA-X signatures, bounded scanning of archives already in the repository, isolated Rust Git history/diff analysis, initial same-file multi-language heuristics, and quick/default/deep profiles. Package reputation and registry artifact retrieval are outside PreflightX's scope. Full fuzz campaigns, broad corpus calibration, and observed macOS/Windows runtime results remain Stage 4 release gates; CI is configured for all three operating systems.
+> Development status: Stage 3 local acceptance is complete; Stage 4 hardening is underway. The Linux CLI applies Landlock and seccomp to scans and Git diffs where supported. Unsupported or unavailable sandbox backends fail closed unless the user explicitly passes `--no-sandbox`. Deterministic mutation smoke tests do not replace coverage-guided fuzzing; broad corpus calibration, macOS/Windows sandbox backends, observed cross-platform runtime results, and release supply-chain gates remain open.
 
 PreflightX is designed to remain offline by default, treat every target file as hostile, never execute target code, and never modify the repository being inspected.
 
@@ -16,6 +16,7 @@ preflightx . --format markdown
 preflightx . --format sarif
 preflightx . --quick
 preflightx . --deep --history
+preflightx . --no-sandbox  # explicit, warned fallback where OS sandboxing is unavailable
 preflightx doctor
 preflightx diff <good-commit-id>..HEAD
 preflightx rules
@@ -29,6 +30,8 @@ For supported patterns, Stage 2 traces remote responses into `eval`, `Function`,
 This is a bounded malware-focused model, not a complete JavaScript interpreter and not a verdict that a repository is safe. Dynamic module targets, unresolved imports, parser failures, and reached analysis limits are reported; parser or resource limits make a scan incomplete (exit code 2). Default scans remain offline and never execute or modify target code.
 
 Scans are offline and read-only. The scanner inspects only the repository supplied to it and does not install, download, or execute target packages. It uses its existing static analysis, embedded YARA-X signatures, and bounded parsers to identify concealed code and evidence-backed execution chains; reports remain limited to what this version identifies.
+
+On supported Linux kernels, the CLI sandbox allows reads only beneath the requested scan root, denies filesystem writes, and blocks executable launches and network socket syscalls. It refuses writable regular-file, socket, or block-device stdout/stderr descriptors because those can bypass path-based write restrictions; pipe output or explicitly use `--no-sandbox` for file redirection. `--no-sandbox` disables this OS layer and always prints a warning; the scanner's static/offline code path remains in effect. The Rust library functions in `preflightx::scanner` do not install process isolation themselves.
 
 ## Development
 

@@ -12,8 +12,9 @@ Usage:
   preflightx explain <finding-id>
   preflightx version
   preflightx doctor
-  preflightx diff <good-commit>..HEAD
+  preflightx diff <good-commit>..HEAD [--no-sandbox]
   preflightx <path> [--quick|--deep] [--history]
+  preflightx <path> --no-sandbox  (explicitly opt out of OS sandboxing)
   preflightx --help
   preflightx --version
 
@@ -36,6 +37,13 @@ pub struct ScanArgs {
     pub quick: bool,
     pub deep: bool,
     pub history: bool,
+    pub no_sandbox: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct DiffArgs {
+    pub range: String,
+    pub no_sandbox: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -46,7 +54,7 @@ pub enum Command {
     Rules,
     Rule(String),
     Doctor,
-    Diff(String),
+    Diff(DiffArgs),
 }
 
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
@@ -84,8 +92,19 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     }
     if first == "diff" {
         args.next();
-        let range = args.next().ok_or("diff requires <good-commit>..HEAD")?;
-        let range = range.to_string_lossy().into_owned();
+        let mut range = None;
+        let mut no_sandbox = false;
+        for argument in args {
+            if argument == "--no-sandbox" {
+                no_sandbox = true;
+            } else if range
+                .replace(argument.to_string_lossy().into_owned())
+                .is_some()
+            {
+                return Err("diff accepts one commit range".to_owned());
+            }
+        }
+        let range = range.ok_or("diff requires <good-commit>..HEAD")?;
         let Some((base, head)) = range.split_once("..") else {
             return Err("diff requires <good-commit>..HEAD".to_owned());
         };
@@ -96,7 +115,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         {
             return Err("diff requires a hexadecimal commit ID followed by ..HEAD".to_owned());
         }
-        return no_extra(args, Command::Diff(range));
+        return Ok(Command::Diff(DiffArgs { range, no_sandbox }));
     }
     if first == "scan" {
         args.next();
@@ -108,6 +127,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut quick = false;
     let mut deep = false;
     let mut history = false;
+    let mut no_sandbox = false;
     while let Some(argument) = args.next() {
         if argument == "--format" {
             format = parse_format(args.next().ok_or("--format requires a value")?)?;
@@ -123,6 +143,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             deep = true;
         } else if argument == "--history" {
             history = true;
+        } else if argument == "--no-sandbox" {
+            no_sandbox = true;
         } else if argument.to_string_lossy().starts_with('-') {
             return Err(format!("unknown option: {}", argument.to_string_lossy()));
         } else if path.replace(PathBuf::from(argument)).is_some() {
@@ -140,6 +162,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         quick,
         deep,
         history,
+        no_sandbox,
     }))
 }
 
@@ -195,6 +218,7 @@ mod tests {
                 quick: false,
                 deep: false,
                 history: false,
+                no_sandbox: false,
             }))
         );
         assert_eq!(
@@ -212,6 +236,7 @@ mod tests {
                 quick: false,
                 deep: false,
                 history: false,
+                no_sandbox: false,
             }))
         );
     }
@@ -250,6 +275,7 @@ mod tests {
                     quick: false,
                     deep: false,
                     history: false,
+                    no_sandbox: false,
                 }))
             );
         }
@@ -262,6 +288,7 @@ mod tests {
             Ok(Command::Scan(ScanArgs {
                 deep: true,
                 history: true,
+                no_sandbox: false,
                 ..
             }))
         ));
@@ -272,6 +299,24 @@ mod tests {
         assert_eq!(
             parse(args(&["repo", "--quick", "--deep"])),
             Err("--quick and --deep cannot be combined".to_owned())
+        );
+    }
+
+    #[test]
+    fn sandbox_opt_out_is_explicit_for_scans_and_git_diff() {
+        assert!(matches!(
+            parse(args(&["repo", "--no-sandbox"])),
+            Ok(Command::Scan(ScanArgs {
+                no_sandbox: true,
+                ..
+            }))
+        ));
+        assert_eq!(
+            parse(args(&["diff", "1234567..HEAD", "--no-sandbox"])),
+            Ok(Command::Diff(super::DiffArgs {
+                range: "1234567..HEAD".to_owned(),
+                no_sandbox: true,
+            }))
         );
     }
 }

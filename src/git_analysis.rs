@@ -553,6 +553,31 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_commit_object_mutations_fail_closed() {
+        let root = temporary_directory("git-object-mutation");
+        let repo = gix::init(&root).unwrap();
+        let tree = tree_with_file(&repo, "README.md", b"synthetic inert fixture\n");
+        let head = commit(&repo, tree, "synthetic base", std::iter::empty());
+        let git_dir = repo.git_dir().to_owned();
+        drop(repo);
+
+        let id = head.to_string();
+        let object_path = git_dir.join("objects").join(&id[..2]).join(&id[2..]);
+        let original = fs::read(&object_path).unwrap();
+        for iteration in 0..16_u8 {
+            let mutated = vec![iteration.wrapping_mul(17); original.len().max(1)];
+            fs::remove_file(&object_path).unwrap();
+            fs::write(&object_path, mutated).unwrap();
+            assert!(
+                history(&root, false).is_err(),
+                "corrupt Git object mutation {iteration} was accepted"
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn history_and_diff_read_local_objects_without_hooks_or_target_writes() {
         let root = temporary_directory("git-history");
         let repo = gix::init(&root).unwrap();

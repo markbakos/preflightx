@@ -2798,6 +2798,7 @@ dependencies = [
  "infer",
  "json5",
  "jsonschema",
+ "libc",
  "oxc_allocator",
  "oxc_ast",
  "oxc_ast_visit",

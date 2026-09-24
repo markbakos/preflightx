@@ -3,6 +3,7 @@ mod git_analysis;
 pub mod model;
 mod report;
 mod rules;
+mod sandbox;
 pub mod scanner;
 
 use std::{ffi::OsString, process::ExitCode};
@@ -41,6 +42,8 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
                 );
                 println!("Scanner: {}", env!("CARGO_PKG_VERSION"));
                 println!("YARA-X: embedded signatures compile and scan");
+                println!("Sandbox backend: {}", sandbox::backend());
+                println!("Scan sandbox availability is checked at runtime");
                 println!("Repository scans: offline; target code is not executed");
                 ExitCode::SUCCESS
             }
@@ -49,8 +52,12 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Ok(cli::Command::Diff(range)) => {
-            match git_analysis::diff(std::path::Path::new("."), &range) {
+        Ok(cli::Command::Diff(arguments)) => {
+            if let Err(error) = prepare_sandbox(std::path::Path::new("."), arguments.no_sandbox) {
+                eprintln!("scan not started: {error}");
+                return ExitCode::from(2);
+            }
+            match git_analysis::diff(std::path::Path::new("."), &arguments.range) {
                 Ok(output) => {
                     print!("{}", output.output);
                     if output.incomplete {
@@ -66,6 +73,10 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
             }
         }
         Ok(cli::Command::Scan(arguments)) => {
+            if let Err(error) = prepare_sandbox(&arguments.path, arguments.no_sandbox) {
+                eprintln!("scan not started: {error}");
+                return ExitCode::from(2);
+            }
             let report = scanner::scan_with_options(
                 &arguments.path,
                 &scanner::ScanLimits::default(),
@@ -106,4 +117,14 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
             ExitCode::from(3)
         }
     }
+}
+
+fn prepare_sandbox(root: &std::path::Path, disabled: bool) -> Result<(), String> {
+    if disabled {
+        eprintln!("WARNING: OS sandbox disabled by explicit --no-sandbox option");
+        return Ok(());
+    }
+    sandbox::apply(root).map_err(|error| format!("{error}; pass --no-sandbox to opt out"))?;
+    eprintln!("OS sandbox enforced: {}", sandbox::backend());
+    Ok(())
 }

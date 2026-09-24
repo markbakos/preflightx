@@ -1,3 +1,6 @@
+//! Static scanner APIs. The CLI applies process sandboxing before calling these functions;
+//! direct library callers must provide their own process isolation for hostile inputs.
+
 mod analyzers;
 mod archives;
 mod classifier;

