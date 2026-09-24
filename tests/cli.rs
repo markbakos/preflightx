@@ -46,11 +46,23 @@ fn malicious_project_fixtures_produce_expected_high_and_critical_findings() {
         ("remote-eval", "JS-REMOTE-CODE-EXECUTION", "critical"),
         ("secret-exfiltration", "JS-SECRET-EXFILTRATION", "critical"),
         ("concealed-process", "JS-CONCEALED-EXECUTION", "high"),
+        (
+            "shai-hulud-credential-theft",
+            "JS-SECRET-EXFILTRATION",
+            "critical",
+        ),
+        (
+            "polinrider-folder-open",
+            "JS-REMOTE-CODE-EXECUTION",
+            "critical",
+        ),
+        ("startup-persistence", "JS-PERSISTENCE-WRITE", "high"),
     ] {
         let project_root = root.join(project);
         let output = run(&[project_root.to_str().unwrap(), "--format=json"]);
         let report: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(report["status"], "complete", "{project}: {report}");
+        assert_eq!(report["network_access"], "disabled", "{project}: {report}");
         assert!(report["incomplete_reasons"].as_array().unwrap().is_empty());
         assert!(
             report["findings"]
@@ -61,6 +73,58 @@ fn malicious_project_fixtures_produce_expected_high_and_critical_findings() {
             "{project} did not produce {severity} {finding_id}: {}",
             report["findings"]
         );
+        let expected_trigger = match project {
+            "shai-hulud-credential-theft" => "postinstall",
+            "polinrider-folder-open" => "folderOpen",
+            "startup-persistence" => "preinstall",
+            _ => continue,
+        };
+        assert!(
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|finding| finding["id"] == finding_id)
+                .any(|finding| finding["evidence"].to_string().contains(expected_trigger)),
+            "{project} finding did not include trigger {expected_trigger}: {}",
+            report["findings"]
+        );
+        match project {
+            "shai-hulud-credential-theft" => {
+                let secret_findings = report["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|finding| finding["id"] == finding_id)
+                    .collect::<Vec<_>>();
+                let evidence = secret_findings
+                    .iter()
+                    .map(|finding| finding["evidence"].to_string())
+                    .collect::<Vec<_>>();
+                assert!(
+                    evidence.iter().any(|item| item.contains(".npmrc")),
+                    "missing npmrc source: {evidence:?}"
+                );
+                assert!(
+                    evidence.iter().any(|item| item.contains("process.env")),
+                    "missing environment credential source: {evidence:?}"
+                );
+            }
+            "polinrider-folder-open" => assert!(
+                report["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|finding| {
+                        finding["id"] == "JS-REACHABLE-DISGUISED-SOURCE"
+                            && finding["file"] == "fonts/icon.woff2"
+                            && finding["severity"] == "critical"
+                    }),
+                "missing critical fake-font finding: {}",
+                report["findings"]
+            ),
+            _ => {}
+        }
     }
 }
 

