@@ -144,8 +144,10 @@ fn decode_text(bytes: &[u8], js_source: bool) -> (Option<String>, Option<String>
             return (Some("unknown".to_owned()), None);
         }
         let units = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect::<Vec<_>>();
         return match String::from_utf16(&units) {
             Ok(text) => (Some("utf-16le".to_owned()), Some(text)),
@@ -157,8 +159,10 @@ fn decode_text(bytes: &[u8], js_source: bool) -> (Option<String>, Option<String>
             return (Some("unknown".to_owned()), None);
         }
         let units = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_be_bytes(*pair))
             .collect::<Vec<_>>();
         return match String::from_utf16(&units) {
             Ok(text) => (Some("utf-16be".to_owned()), Some(text)),
