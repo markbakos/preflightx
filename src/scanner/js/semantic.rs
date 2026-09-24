@@ -67,11 +67,12 @@ pub fn collect(
         .with_check_syntax_error(true)
         .build(program);
     if !result.diagnostics.is_empty() {
+        let first = result.diagnostics[0].to_string();
         return Collected {
             module: None,
             incomplete_reasons: vec![format!(
-                "JS/TS semantic analysis could not fully inspect {path}: {} diagnostic(s)",
-                result.diagnostics.len()
+                "JS/TS semantic analysis could not fully inspect {path}: {} diagnostic(s), first: {first}",
+                result.diagnostics.len(),
             )],
         };
     }

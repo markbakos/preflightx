@@ -87,6 +87,7 @@ pub enum Expr {
 }
 
 const THROWN_VALUE: &str = "\0preflightx-thrown";
+const MAX_CLEAN_FLOW_VALUE_COPY: usize = 4_096;
 
 struct Lower {
     line_starts: Vec<u32>,
@@ -1077,11 +1078,75 @@ impl Value {
         labels.iter().find_map(|label| self.labels.get(label))
     }
 
+    fn has_security_label(&self) -> bool {
+        !self.labels.is_empty() || self.fields.values().any(Self::has_security_label)
+    }
+
+    fn flow_work_size(&self, limit: usize) -> usize {
+        let clean_large_value = !self.has_security_label()
+            && self.work_size(MAX_CLEAN_FLOW_VALUE_COPY) > MAX_CLEAN_FLOW_VALUE_COPY;
+        if !clean_large_value {
+            return self.work_size(limit);
+        }
+        self.work_size_shallow(limit)
+            .saturating_add(self.fields.iter().fold(0usize, |size, (key, value)| {
+                size.saturating_add(1)
+                    .saturating_add(key.len())
+                    .saturating_add(value.work_size_shallow(limit.saturating_sub(size)))
+            }))
+    }
+
+    fn flow_clone(&self) -> Self {
+        // ponytail: large clean values keep one level of literals; use shared values if deeper clean config proves necessary.
+        let clean_large_value = !self.has_security_label()
+            && self.work_size(MAX_CLEAN_FLOW_VALUE_COPY) > MAX_CLEAN_FLOW_VALUE_COPY;
+        if !clean_large_value {
+            return self.clone();
+        }
+        let mut copy = self.clone_shallow();
+        copy.fields = self
+            .fields
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone_shallow()))
+            .collect();
+        copy
+    }
+
+    fn clone_shallow(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            literal: self.literal.clone(),
+            path_hint: self.path_hint.clone(),
+            path_key: self.path_key.clone(),
+            stream_reader: self.stream_reader,
+            labels: self.labels.clone(),
+            fields: BTreeMap::new(),
+        }
+    }
+
     fn file_target(&self) -> Option<String> {
         self.literal.clone().or_else(|| self.path_key.clone())
     }
 
     fn work_size(&self, limit: usize) -> usize {
+        let mut size = self.work_size_shallow(limit);
+        if size > limit {
+            return limit.saturating_add(1);
+        }
+        for (key, value) in &self.fields {
+            size = size.saturating_add(1).saturating_add(key.len());
+            if size > limit {
+                return limit.saturating_add(1);
+            }
+            size = size.saturating_add(value.work_size(limit.saturating_sub(size)));
+            if size > limit {
+                return limit.saturating_add(1);
+            }
+        }
+        size
+    }
+
+    fn work_size_shallow(&self, limit: usize) -> usize {
         let mut size = 1usize;
         for text in [
             self.name.as_deref(),
@@ -1106,16 +1171,6 @@ impl Value {
                 }
             }
         }
-        for (key, value) in &self.fields {
-            size = size.saturating_add(1).saturating_add(key.len());
-            if size > limit {
-                return limit.saturating_add(1);
-            }
-            size = size.saturating_add(value.work_size(limit.saturating_sub(size)));
-            if size > limit {
-                return limit.saturating_add(1);
-            }
-        }
         size
     }
 }
@@ -1132,15 +1187,21 @@ struct Evaluator<'a> {
     findings: Vec<Finding>,
     seen: std::collections::BTreeSet<(String, String, u64)>,
     work: usize,
+    work_limit: usize,
     total_work: usize,
     limited: bool,
+    limit_context: Option<String>,
+    call_stack: Vec<String>,
     written: BTreeMap<String, Value>,
     stream_data: BTreeMap<(String, String), BTreeMap<String, Value>>,
 }
 
-const MAX_FLOW_WORK: usize = 100_000;
-const MAX_TOTAL_FLOW_WORK: usize = 1_000_000;
-const MAX_CALL_DEPTH: usize = 32;
+const MIN_FLOW_WORK: usize = 100_000;
+const MAX_FLOW_WORK: usize = 32_000_000;
+const FLOW_WORK_PER_SOURCE_BYTE: usize = 512;
+const MAX_TOTAL_FLOW_WORK: usize = 100_000_000;
+const MAX_EVALUATION_DEPTH: usize = 512;
+const MAX_EXPORT_RESOLUTION_DEPTH: usize = 32;
 
 pub fn analyze_flows(
     modules: &[ModuleFacts],
@@ -1161,8 +1222,11 @@ pub fn analyze_flows(
         findings: Vec::new(),
         seen: std::collections::BTreeSet::new(),
         work: 0,
+        work_limit: MIN_FLOW_WORK,
         total_work: 0,
         limited: false,
+        limit_context: None,
+        call_stack: Vec::new(),
         written: BTreeMap::new(),
         stream_data: BTreeMap::new(),
     };
@@ -1177,6 +1241,10 @@ pub fn analyze_flows(
         }
         evaluator.written.clear();
         evaluator.work = 0;
+        evaluator.work_limit = module
+            .source_bytes
+            .saturating_mul(FLOW_WORK_PER_SOURCE_BYTE)
+            .clamp(MIN_FLOW_WORK, MAX_FLOW_WORK);
         let mut environment = evaluator.imports(module);
         evaluator.run(&module.id, &module.flow.body, &mut environment, 0);
         if evaluator.limited {
@@ -1226,10 +1294,12 @@ pub fn analyze_flows(
         findings: evaluator.findings,
         incomplete_reasons: if evaluator.limited {
             vec![format!(
-                "JS/TS data-flow work limit of {MAX_FLOW_WORK} units per module, {MAX_TOTAL_FLOW_WORK} total units, or call depth {MAX_CALL_DEPTH} reached while analyzing {} (module work: {}, total work: {})",
+                "JS/TS data-flow work limit of {} units for this module, {MAX_TOTAL_FLOW_WORK} total units, or evaluator nesting limit {MAX_EVALUATION_DEPTH} reached while analyzing {} (module work: {}, total work: {}, context: {})",
+                evaluator.work_limit,
                 limited_at.unwrap_or("an unknown module"),
                 evaluator.work,
-                evaluator.total_work
+                evaluator.total_work,
+                evaluator.limit_context.as_deref().unwrap_or("unknown")
             )]
         } else {
             Vec::new()
@@ -1241,7 +1311,18 @@ impl Evaluator<'_> {
     fn charge(&mut self, amount: usize) -> bool {
         self.work = self.work.saturating_add(amount);
         self.total_work = self.total_work.saturating_add(amount);
-        if self.work > MAX_FLOW_WORK || self.total_work > MAX_TOTAL_FLOW_WORK {
+        if self.work > self.work_limit {
+            self.limit_context = Some(format!(
+                "per-module flow work budget in {}",
+                self.call_stack.last().map_or("module body", String::as_str)
+            ));
+            self.limited = true;
+            false
+        } else if self.total_work > MAX_TOTAL_FLOW_WORK {
+            self.limit_context = Some(format!(
+                "scan-wide flow work budget in {}",
+                self.call_stack.last().map_or("module body", String::as_str)
+            ));
             self.limited = true;
             false
         } else {
@@ -1249,15 +1330,15 @@ impl Evaluator<'_> {
         }
     }
 
-    fn environment_work(environment: &BTreeMap<String, Value>) -> usize {
+    fn environment_work(environment: &BTreeMap<String, Value>, limit: usize) -> usize {
         let mut work = 0usize;
         for (name, value) in environment {
             work = work
                 .saturating_add(1)
                 .saturating_add(name.len())
-                .saturating_add(value.work_size(MAX_FLOW_WORK.saturating_sub(work)));
-            if work > MAX_FLOW_WORK {
-                return MAX_FLOW_WORK.saturating_add(1);
+                .saturating_add(value.flow_work_size(limit.saturating_sub(work)));
+            if work > limit {
+                return limit.saturating_add(1);
             }
         }
         work
@@ -1267,22 +1348,33 @@ impl Evaluator<'_> {
         &mut self,
         environment: &BTreeMap<String, Value>,
     ) -> Option<BTreeMap<String, Value>> {
-        self.charge(Self::environment_work(environment))
-            .then(|| environment.clone())
+        self.charge(Self::environment_work(environment, self.work_limit))
+            .then(|| Self::clone_environment(environment))
     }
 
     fn fork_branches(
         &mut self,
         environment: &BTreeMap<String, Value>,
     ) -> Option<(BTreeMap<String, Value>, BTreeMap<String, Value>)> {
-        let work = Self::environment_work(environment).saturating_mul(3);
-        self.charge(work)
-            .then(|| (environment.clone(), environment.clone()))
+        let work = Self::environment_work(environment, self.work_limit).saturating_mul(3);
+        self.charge(work).then(|| {
+            (
+                Self::clone_environment(environment),
+                Self::clone_environment(environment),
+            )
+        })
+    }
+
+    fn clone_environment(environment: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+        environment
+            .iter()
+            .map(|(name, value)| (name.clone(), value.flow_clone()))
+            .collect()
     }
 
     fn copy_value(&mut self, value: &Value) -> Value {
-        if self.charge(value.work_size(MAX_FLOW_WORK)) {
-            value.clone()
+        if self.charge(value.flow_work_size(self.work_limit)) {
+            value.flow_clone()
         } else {
             Value::default()
         }
@@ -1322,8 +1414,14 @@ impl Evaluator<'_> {
         environment: &mut BTreeMap<String, Value>,
         depth: usize,
     ) -> Option<Value> {
-        if depth >= MAX_CALL_DEPTH {
+        if depth >= MAX_EVALUATION_DEPTH {
             self.limited = true;
+            self.limit_context.get_or_insert_with(|| {
+                self.call_stack
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "nested control flow".to_owned())
+            });
             return None;
         }
         let mut pending_return: Option<Value> = None;
@@ -1822,7 +1920,7 @@ impl Evaluator<'_> {
                 }
                 if stream_data {
                     // Stream data callbacks run before `end`; other async callback effects stay scoped.
-                    if !self.charge(Self::environment_work(&scope)) {
+                    if !self.charge(Self::environment_work(&scope, self.work_limit)) {
                         return Value::default();
                     }
                     let chunks = self.stream_data.entry(stream_key).or_default();
@@ -2407,6 +2505,13 @@ impl Evaluator<'_> {
         mut scope: BTreeMap<String, Value>,
         depth: usize,
     ) -> (Value, Option<Value>) {
+        let call = format!("{path}::{name}");
+        let recursive = self.call_stack.iter().any(|active| active == &call);
+        // ponytail: analyze clean-argument recursion once; add bounded summaries if recursive taint effects become a demonstrated miss.
+        if recursive && !args.iter().any(Value::has_security_label) {
+            return (Value::default(), None);
+        }
+        self.call_stack.push(call);
         if let Some((receiver, _)) = name.rsplit_once('.') {
             scope.insert("this".to_owned(), Value::named(receiver.to_owned()));
         }
@@ -2418,6 +2523,7 @@ impl Evaluator<'_> {
             );
         }
         let returned = self.run(path, &function.body, &mut scope, depth);
+        self.call_stack.pop();
         let thrown = scope.remove(THROWN_VALUE);
         let returned = returned.unwrap_or_default();
         (
@@ -2437,7 +2543,7 @@ impl Evaluator<'_> {
         } else {
             exported.to_owned()
         };
-        for _ in 0..MAX_CALL_DEPTH {
+        for _ in 0..MAX_EXPORT_RESOLUTION_DEPTH {
             let module = self.modules.get(id.as_str())?;
             if let Some(local) = module.flow.exports.get(&exported)
                 && let Some(function) = module.flow.functions.get(local)

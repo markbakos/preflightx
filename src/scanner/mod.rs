@@ -8,6 +8,9 @@ mod walker;
 
 pub use limits::ScanLimits;
 
+const MAX_SEMANTIC_MODULES: usize = 20_000;
+const MAX_SEMANTIC_BYTES: usize = 64 * 1024 * 1024;
+
 use crate::model::{Risk, ScanReport, ScanStatus, ScanSummary, Severity};
 use std::{collections::BTreeMap, path::Path};
 
@@ -71,10 +74,12 @@ pub fn scan(path: &Path, limits: &ScanLimits) -> ScanReport {
         }
         for module in javascript.modules {
             let size = module.source_bytes;
-            if modules.len() >= 10_000 || semantic_bytes.saturating_add(size) > 64 * 1024 * 1024 {
+            if modules.len() >= MAX_SEMANTIC_MODULES
+                || semantic_bytes.saturating_add(size) > MAX_SEMANTIC_BYTES
+            {
                 if !semantic_limit_reported {
                     analyzer_incomplete.push(format!(
-                        "JS/TS global semantic analysis limit reached before {}; additional modules were omitted",
+                        "JS/TS global semantic analysis limit of {MAX_SEMANTIC_MODULES} modules or {MAX_SEMANTIC_BYTES} source bytes reached before {}; additional modules were omitted",
                         input.relative
                     ));
                     semantic_limit_reported = true;

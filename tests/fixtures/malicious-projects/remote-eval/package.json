@@ -1,0 +1,1 @@
+{"name":"example-remote-loader","private":true,"scripts":{"start":"node src/index.js"}}

@@ -1,13 +1,40 @@
 use crate::model::{Confidence, Finding, Severity};
 use oxc_allocator::Allocator;
-use oxc_parser::Parser;
+use oxc_parser::{Parser, ParserReturn};
 use oxc_span::SourceType;
 use std::{collections::HashMap, ops::Range, path::Path};
 
 mod flow;
 mod semantic;
-pub use flow::analyze_flows;
 pub use semantic::{Capability, ModuleFacts};
+
+const FLOW_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
+
+pub fn analyze_flows(
+    modules: &[ModuleFacts],
+    reachable: &std::collections::BTreeMap<String, Vec<String>>,
+) -> flow::FlowResult {
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("preflightx-js-flow".to_owned())
+            .stack_size(FLOW_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, || flow::analyze_flows(modules, reachable));
+        match worker {
+            Ok(worker) => worker.join().unwrap_or_else(|_| flow::FlowResult {
+                findings: Vec::new(),
+                incomplete_reasons: vec![
+                    "JS/TS data-flow worker failed; flow coverage is incomplete".to_owned(),
+                ],
+            }),
+            Err(error) => flow::FlowResult {
+                findings: Vec::new(),
+                incomplete_reasons: vec![format!(
+                    "could not start JS/TS data-flow worker; flow coverage is incomplete: {error}"
+                )],
+            },
+        }
+    })
+}
 
 const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_NESTING: usize = 256;
@@ -228,6 +255,53 @@ pub fn analyze(path: &str, text: Option<&str>) -> JsAnalysis {
     ) {
         Ok(module) => module,
         Err(reason) => {
+            if supported && let Some(variants) = separated_source_variants(text) {
+                let mut fact_count = 0usize;
+                for (index, (line_offset, source)) in variants.into_iter().enumerate() {
+                    let remaining_facts = semantic::MAX_FACTS_PER_FILE.saturating_sub(fact_count);
+                    if remaining_facts == 0 {
+                        result.incomplete_reasons.push(format!(
+                            "JS/TS fact limit of {} reached across separated source cases: {path}",
+                            semantic::MAX_FACTS_PER_FILE
+                        ));
+                        break;
+                    }
+                    let id = format!("{path}#source-case-{index}");
+                    match parse_source(
+                        path,
+                        &id,
+                        source,
+                        source_type,
+                        line_offset,
+                        true,
+                        remaining_facts,
+                    ) {
+                        Ok(Some(module)) => {
+                            fact_count += module.imports.len() + module.calls.len();
+                            result.modules.push(module);
+                        }
+                        Ok(None) => {}
+                        Err(reason) if looks_like_code_source(source) => result
+                            .incomplete_reasons
+                            .push(format!("{reason} in source case {}: {path}", index + 1)),
+                        Err(_) => {}
+                    }
+                }
+                if !result.modules.is_empty() || !result.incomplete_reasons.is_empty() {
+                    result.language = Some(
+                        if source_type.is_typescript() {
+                            "typescript"
+                        } else {
+                            "javascript"
+                        }
+                        .to_owned(),
+                    );
+                    return result;
+                }
+            }
+            if supported && !looks_like_code_source(text) && !reason.contains("limit") {
+                return result;
+            }
             result.incomplete_reasons.push(format!("{reason}: {path}"));
             return result;
         }
@@ -260,6 +334,32 @@ pub fn analyze(path: &str, text: Option<&str>) -> JsAnalysis {
     result
 }
 
+fn separated_source_variants(source: &str) -> Option<Vec<(u64, &str)>> {
+    let mut variants = Vec::new();
+    let mut offset = 0usize;
+    let mut start = 0usize;
+    let mut start_line = 0u64;
+    let mut has_separator = false;
+    for (line, part) in source.split_inclusive('\n').enumerate() {
+        let line = line as u64;
+        if part.trim() == "---" {
+            has_separator = true;
+            let variant = &source[start..offset];
+            if !variant.trim().is_empty() {
+                variants.push((start_line, variant));
+            }
+            start = offset + part.len();
+            start_line = line + 1;
+        }
+        offset += part.len();
+    }
+    let final_variant = &source[start..];
+    if !final_variant.trim().is_empty() {
+        variants.push((start_line, final_variant));
+    }
+    (has_separator && variants.len() > 1).then_some(variants)
+}
+
 fn parse_source(
     path: &str,
     id: &str,
@@ -290,6 +390,38 @@ fn parse_source(
     let parsed = Parser::new(&allocator, source, source_type).parse();
     let parsed = if (parsed.fatal_error || !parsed.diagnostics.is_empty())
         && !parsed.is_flow_language
+        && source_type.is_unambiguous()
+        && source.contains("return")
+    {
+        let commonjs = Parser::new(&allocator, source, source_type.with_commonjs(true)).parse();
+        if !commonjs.fatal_error && commonjs.diagnostics.is_empty() {
+            commonjs
+        } else {
+            parsed
+        }
+    } else {
+        parsed
+    };
+    let parsed = if (parsed.fatal_error || !parsed.diagnostics.is_empty())
+        && !parsed.is_flow_language
+        && source_type.is_javascript()
+    {
+        let typed = Parser::new(
+            &allocator,
+            source,
+            source_type.with_typescript(true).with_jsx(true),
+        )
+        .parse();
+        if !typed.fatal_error && typed.diagnostics.is_empty() {
+            typed
+        } else {
+            parsed
+        }
+    } else {
+        parsed
+    };
+    let parsed = if (parsed.fatal_error || !parsed.diagnostics.is_empty())
+        && !parsed.is_flow_language
         && !source_type.is_typescript()
         && !source_type.is_jsx()
         && source.contains('<')
@@ -300,8 +432,9 @@ fn parse_source(
             jsx_parsed
         } else {
             return Err(format!(
-                "JS/TS parser could not fully parse: {} diagnostic(s)",
-                parsed.diagnostics.len()
+                "JS/TS parser could not fully parse: {} diagnostic(s), first: {}",
+                parsed.diagnostics.len(),
+                first_parser_diagnostic(&parsed, source)
             ));
         }
     } else if parsed.fatal_error || !parsed.diagnostics.is_empty() {
@@ -309,8 +442,9 @@ fn parse_source(
             return Err("Flow syntax is unsupported by the JS/TS parser".to_owned());
         }
         return Err(format!(
-            "JS/TS parser could not fully parse: {} diagnostic(s)",
-            parsed.diagnostics.len()
+            "JS/TS parser could not fully parse: {} diagnostic(s), first: {}",
+            parsed.diagnostics.len(),
+            first_parser_diagnostic(&parsed, source)
         ));
     } else {
         parsed
@@ -331,6 +465,60 @@ fn parse_source(
         return Err(facts.incomplete_reasons.join("; "));
     }
     Ok(facts.module)
+}
+
+fn first_parser_diagnostic(parsed: &ParserReturn<'_>, source: &str) -> String {
+    let Some(diagnostic) = parsed.diagnostics.first() else {
+        return "fatal parser error".to_owned();
+    };
+    let line = diagnostic.labels.first().map(|label| {
+        let mut offset = (label.offset() as usize).min(source.len());
+        while !source.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        source[..offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1
+    });
+    match line {
+        Some(line) => format!("{diagnostic} at line {line}"),
+        None => diagnostic.to_string(),
+    }
+}
+
+fn looks_like_code_source(source: &str) -> bool {
+    // ponytail: syntax markers keep plain-text fixtures out of JS error reporting; broaden only for a confirmed source form.
+    source.bytes().any(|byte| {
+        matches!(
+            byte,
+            b'{' | b'}' | b'(' | b')' | b'[' | b']' | b';' | b'=' | b'<' | b'>' | b':'
+        )
+    }) || [
+        "const ",
+        "let ",
+        "var ",
+        "function ",
+        "class ",
+        "import ",
+        "export ",
+        "return ",
+        "async ",
+        "await ",
+        "if(",
+        "if ",
+        "try ",
+        "require(",
+        "eval(",
+        "process.",
+        "fetch(",
+        "module.",
+        "exports.",
+        "=>",
+    ]
+    .iter()
+    .any(|marker| source.contains(marker))
 }
 
 fn document_kind(extension: Option<&str>) -> Option<(bool, bool)> {
@@ -788,6 +976,58 @@ mod tests {
     }
 
     #[test]
+    fn retries_ambiguous_javascript_as_commonjs_for_top_level_return() {
+        let commonjs = analyze(
+            "fixture.js",
+            Some("if (enabled) return; module.exports = 1;"),
+        );
+        assert!(commonjs.incomplete_reasons.is_empty());
+        assert_eq!(commonjs.modules.len(), 1);
+
+        let malformed = analyze("broken.js", Some("const value = ; return;"));
+        assert_eq!(malformed.incomplete_reasons.len(), 1);
+    }
+
+    #[test]
+    fn parses_type_annotated_javascript_when_typescript_grammar_is_unambiguous() {
+        let typed = analyze(
+            "typed.js",
+            Some(
+                "export function forwardRef<Props, ElementType extends object>(render: (props: Props) => React$Node) { return render({} as Props); }",
+            ),
+        );
+        assert!(
+            typed.incomplete_reasons.is_empty(),
+            "{:?}",
+            typed.incomplete_reasons
+        );
+        assert_eq!(typed.modules.len(), 1);
+    }
+
+    #[test]
+    fn parses_delimited_javascript_fixture_cases_independently() {
+        let alternatives = analyze(
+            "alternatives.js",
+            Some("module.exports = 1;\n---\nmodule.exports = 2;"),
+        );
+        assert!(
+            alternatives.incomplete_reasons.is_empty(),
+            "{:?}",
+            alternatives.incomplete_reasons
+        );
+        assert_eq!(alternatives.modules.len(), 2);
+        assert_ne!(alternatives.modules[0].id, alternatives.modules[1].id);
+
+        let malformed = analyze(
+            "alternatives.js",
+            Some("module.exports = 1;\n---\nmodule.exports = ;"),
+        );
+        assert_eq!(malformed.modules.len(), 1);
+        assert_eq!(malformed.incomplete_reasons.len(), 1);
+        assert!(malformed.incomplete_reasons[0].contains("source case 2"));
+    }
+
+    #[test]
     fn reports_flow_as_unsupported_instead_of_a_generic_parse_failure() {
         let analysis = analyze("flow.js", Some("// @flow\nconst value: string = 'x';"));
         assert!(
@@ -982,6 +1222,13 @@ mod tests {
     fn syntax_and_size_failures_are_incomplete() {
         let malformed = analyze("broken.js", Some("const = ;"));
         assert_eq!(malformed.incomplete_reasons.len(), 1);
+        let malformed_unicode = analyze("broken.js", Some("const name = 'é'; const = ;"));
+        assert_eq!(malformed_unicode.incomplete_reasons.len(), 1);
+        let invalid_semantics = analyze("duplicate.js", Some("const value = 1; const value = 2;"));
+        assert!(invalid_semantics.incomplete_reasons[0].contains("already been declared"));
+        let text_fixture = analyze("fixture.js", Some("test content"));
+        assert!(text_fixture.incomplete_reasons.is_empty());
+        assert!(text_fixture.modules.is_empty());
         let disguised_malformed = analyze("broken.svg", Some("const = ; require('x');"));
         assert_eq!(disguised_malformed.incomplete_reasons.len(), 1);
         let oversized = analyze("large.js", Some(&" ".repeat(MAX_PARSE_BYTES + 1)));

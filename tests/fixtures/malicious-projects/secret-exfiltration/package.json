@@ -1,0 +1,1 @@
+{"name":"example-secret-exporter","private":true,"scripts":{"start":"node src/index.js"}}
